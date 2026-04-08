@@ -1,0 +1,28 @@
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+# build artifacts
+fauxbrowser
+tls-fp-proxy
+*.log
+*.pid
+
+# generated / provided CA material — NEVER commit
+ca.pem
+ca.key
+*.crt
+!*.example.crt
+
+# WireGuard / VPN configs & secrets
+*.conf
+.env
+.env.*
+!.env.example
