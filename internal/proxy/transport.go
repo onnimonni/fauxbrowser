@@ -21,6 +21,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -32,6 +33,8 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"golang.org/x/net/proxy"
+
+	"github.com/onnimonni/fauxbrowser/internal/solver"
 )
 
 // RotationHook is called with every upstream response so the rotator
@@ -58,6 +61,26 @@ type TransportOptions struct {
 	// Rotator is notified of every upstream response. May be nil in
 	// tests.
 	Rotator RotationHook
+
+	// SolverCache is an optional WAF-challenge solver cache. When
+	// set, dispatch() will:
+	//   1. Proactively stamp cached cookies on outbound requests
+	//      whose (host, exit_ip) is in the cache.
+	//   2. After receiving a response, if it matches a known
+	//      challenge fingerprint AND the cache had no fresh entry,
+	//      invoke the solver, cache the result, and one-shot retry
+	//      with the new cookies stamped on.
+	//
+	// Nil = solver disabled. The fast path stays unchanged in that
+	// case.
+	SolverCache *solver.Cache
+
+	// ExitIPProvider returns the current exit IP for solver cache
+	// keying. Called on every request, so it must be cheap. Nil =
+	// solver disabled (the cache key needs the exit IP to be
+	// meaningful — without it, cookies from different exits would
+	// pollute each other).
+	ExitIPProvider func() string
 }
 
 // Transport is an http.RoundTripper backed by a single tls-client with
@@ -141,19 +164,122 @@ func (t *Transport) Close() {
 }
 
 // RoundTrip implements http.RoundTripper.
+//
+// Flow:
+//
+//  1. If a SolverCache is configured AND the (host, exit_ip) has a
+//     fresh cached solution, stamp those cookies on the outbound
+//     request before dispatch. This is the proactive path: known
+//     challenged hosts skip the solver entirely on every repeat
+//     visit.
+//  2. Dispatch the request via tls-client.
+//  3. If the response is a known WAF challenge AND we have a
+//     solver, drain the response body, invoke the solver via the
+//     cache (singleflight-deduped), then re-dispatch the original
+//     request with the new cookies stamped on. Return the retry
+//     response.
+//  4. Notify the rotator of the (final) response so its 429/403
+//     heuristic can fire if applicable.
 func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
+	host := r.URL.Hostname()
+	exitIP := ""
+	if t.opts.ExitIPProvider != nil {
+		exitIP = t.opts.ExitIPProvider()
+	}
+
+	// Step 1: proactive cookie stamping.
+	var cachedSol *solver.Solution
+	if t.opts.SolverCache != nil && exitIP != "" {
+		cachedSol = t.opts.SolverCache.Lookup(host, exitIP)
+		if cachedSol != nil {
+			stampSolutionCookies(r, cachedSol)
+		}
+	}
+
 	resp, err := t.dispatch(r)
 	if err != nil {
 		return nil, err
 	}
+
+	// Step 2: solver path. Only if a solver is configured AND the
+	// response looks like a known challenge AND we haven't already
+	// proactively stamped cached cookies (if we did and it STILL
+	// failed, that's a circuit-breaker case — running the solver
+	// again would just produce the same cookies and loop).
+	if t.opts.SolverCache != nil && exitIP != "" && cachedSol == nil {
+		kind := solver.DetectChallenge(resp.StatusCode, resp.Header)
+		if kind.Solvable() {
+			slog.Info("solver path: challenge detected, invoking solver",
+				"host", host, "exit_ip", exitIP, "kind", kind.String(),
+				"status", resp.StatusCode)
+			// Drop the challenge response body, we'll replace it.
+			_ = resp.Body.Close()
+			retryResp, solveErr := t.solveAndRetry(r, host, exitIP)
+			if solveErr != nil {
+				slog.Warn("solver path: solve failed, returning last response",
+					"host", host, "err", solveErr)
+				resp, err = t.dispatch(r)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				resp = retryResp
+				// Circuit breaker: if the retry STILL looks
+				// challenged, the cookies didn't satisfy the WAF
+				// (most likely the WAF pins cf_clearance to the
+				// solver browser's TLS fingerprint, which doesn't
+				// match the chrome146 we use on the fast path).
+				// Invalidate the cache so we don't keep stamping
+				// the same useless cookies, and pass the 4xx
+				// through to the caller.
+				if solver.DetectChallenge(retryResp.StatusCode, retryResp.Header).Solvable() {
+					slog.Warn("solver path: retry STILL challenged — invalidating cache, propagating 4xx to caller",
+						"host", host, "exit_ip", exitIP, "status", retryResp.StatusCode)
+					t.opts.SolverCache.Invalidate(host, exitIP)
+				}
+			}
+		}
+	}
+
+	// Step 3: rotator notification.
 	if t.opts.Rotator != nil {
-		host := r.URL.Hostname()
 		if fired, reason := t.opts.Rotator.RotateIfTriggered(host, resp.StatusCode, resp.Header); fired {
 			slog.Info("rotation triggered by response heuristic",
 				"status", resp.StatusCode, "host", host, "reason", reason)
 		}
 	}
 	return resp, nil
+}
+
+// solveAndRetry runs the solver via the cache and re-dispatches
+// the original request with the new cookies stamped on.
+func (t *Transport) solveAndRetry(orig *http.Request, host, exitIP string) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(orig.Context(), 60*time.Second)
+	defer cancel()
+	sol, err := t.opts.SolverCache.LookupOrSolve(ctx, orig.URL, exitIP)
+	if err != nil {
+		return nil, err
+	}
+	stampSolutionCookies(orig, sol)
+	return t.dispatch(orig)
+}
+
+// stampSolutionCookies merges the solver's cookies into the
+// request's existing Cookie header. If the caller already provided
+// a Cookie header it's preserved verbatim and the solver cookies
+// are appended.
+func stampSolutionCookies(r *http.Request, sol *solver.Solution) {
+	if sol == nil || len(sol.Cookies) == 0 {
+		return
+	}
+	parts := make([]string, 0, len(sol.Cookies)+1)
+	if existing := r.Header.Get("Cookie"); existing != "" {
+		parts = append(parts, existing)
+	}
+	for _, c := range sol.Cookies {
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	r.Header.Set("Cookie", strings.Join(parts, "; "))
 }
 
 func (t *Transport) dispatch(r *http.Request) (*http.Response, error) {
@@ -204,6 +330,24 @@ func (t *Transport) dispatch(r *http.Request) (*http.Response, error) {
 	for k, vs := range fresp.Header {
 		ck := http.CanonicalHeaderKey(k)
 		out.Header[ck] = append(out.Header[ck], vs...)
+	}
+	// Issue #1: tls-client auto-decompresses gzip/br/zstd response
+	// bodies but the upstream Content-Encoding + Content-Length
+	// headers still describe the COMPRESSED bytes. Forwarding both
+	// unchanged makes downstream HTTP parsers (Mint, Finch, Hyper,
+	// curl) see a body shorter than the advertised Content-Length
+	// and report the response as truncated.
+	//
+	// Fix: when the upstream said the body was compressed, drop
+	// Content-Encoding and Content-Length, set out.ContentLength
+	// to -1 so net/http forces chunked transfer-encoding on the
+	// wire to the downstream client. The body bytes we serve are
+	// already plain-text (tls-client decompressed them) so this
+	// is consistent end-to-end.
+	if ce := strings.ToLower(out.Header.Get("Content-Encoding")); ce != "" && ce != "identity" {
+		out.Header.Del("Content-Encoding")
+		out.Header.Del("Content-Length")
+		out.ContentLength = -1
 	}
 	return out, nil
 }

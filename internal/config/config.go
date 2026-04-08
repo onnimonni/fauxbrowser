@@ -35,6 +35,16 @@ type Config struct {
 	// values: chrome146, chrome144, chrome133, chrome131.
 	Profile string
 
+	// WAF challenge solver. "" / "none" = disabled (no Chromium
+	// dependency, the binary is fully self-contained). "chromedp"
+	// launches a fresh headless Chromium per solve via chromedp,
+	// routes its traffic back through fauxbrowser CONNECT, extracts
+	// clearance cookies, and caches them per (host, exit_ip).
+	Solver         string        // "none" (default), "chromedp"
+	SolverTTL      time.Duration // cookie cache TTL (default 25m)
+	SolverTimeout  time.Duration // per-solve browser deadline (default 30s)
+	ChromiumPath   string        // override Chromium binary path (default = $PATH lookup)
+
 	TimeoutSecs   int
 	CooldownSecs  int           // taint cooldown per server after 429/403
 	HandshakeWait time.Duration // handshake observation window per rotation attempt
@@ -54,6 +64,9 @@ func Default() *Config {
 		TargetHeader:  "X-Target-URL",
 		VPNTier:       "free",
 		Profile:       "chrome146",
+		Solver:        "none",
+		SolverTTL:     25 * time.Minute,
+		SolverTimeout: 30 * time.Second,
 		TimeoutSecs:   60,
 		CooldownSecs:      900, // 15 min
 		HandshakeWait:     6 * time.Second,
@@ -105,6 +118,22 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("FAUXBROWSER_PROFILE"); v != "" {
 		c.Profile = v
+	}
+	if v := os.Getenv("FAUXBROWSER_SOLVER"); v != "" {
+		c.Solver = v
+	}
+	if v := os.Getenv("FAUXBROWSER_SOLVER_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.SolverTTL = d
+		}
+	}
+	if v := os.Getenv("FAUXBROWSER_SOLVER_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.SolverTimeout = d
+		}
+	}
+	if v := os.Getenv("FAUXBROWSER_CHROMIUM_PATH"); v != "" {
+		c.ChromiumPath = v
 	}
 	if v := os.Getenv("FAUXBROWSER_VPN_COUNTRIES"); v != "" {
 		c.VPNCountries = SplitCSV(v)

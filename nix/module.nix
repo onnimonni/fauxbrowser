@@ -42,6 +42,10 @@ let
       ++ lib.optional (cfg.vpnContinents != []) "FAUXBROWSER_VPN_CONTINENTS=${lib.concatStringsSep "," cfg.vpnContinents}"
       ++ lib.optional (cfg.logLevel != null) "FAUXBROWSER_LOG_LEVEL=${cfg.logLevel}"
       ++ lib.optional (cfg.wgConfFile != null) "FAUXBROWSER_WG_CONF=${cfg.wgConfFile}"
+      ++ lib.optional (cfg.solver != "none") "FAUXBROWSER_SOLVER=${cfg.solver}"
+      ++ lib.optional (cfg.solver != "none") "FAUXBROWSER_SOLVER_TTL=${cfg.solverTtl}"
+      ++ lib.optional (cfg.solver != "none") "FAUXBROWSER_SOLVER_TIMEOUT=${cfg.solverTimeout}"
+      ++ lib.optional (cfg.solver == "chromedp") "FAUXBROWSER_CHROMIUM_PATH=${cfg.chromiumPackage}/bin/chromium"
       ++ [ "" ]  # trailing newline
     )
   );
@@ -119,6 +123,57 @@ in
       type = lib.types.nullOr lib.types.str;
       default = "chrome146";
       description = "Browser profile (chrome146 / chrome144 / chrome133 / chrome131 / latest).";
+    };
+
+    solver = lib.mkOption {
+      type = lib.types.enum [ "none" "chromedp" ];
+      default = "none";
+      description = ''
+        WAF challenge solver. `none` (default) keeps fauxbrowser as
+        a single self-contained binary with no Chromium dependency.
+        `chromedp` enables on-demand headless Chromium spawning to
+        solve Cloudflare/Akamai/DataDome/PerimeterX JavaScript
+        challenges; the resulting clearance cookies are cached per
+        (host, exit_ip) and reused on subsequent fauxbrowser
+        requests until rotation or TTL expiry.
+
+        Setting this to `chromedp` automatically adds `pkgs.chromium`
+        to the systemd unit's PATH and tweaks the sandbox to allow
+        Chromium to spawn its sandbox helpers (Chromium needs to
+        fork and create user namespaces).
+      '';
+    };
+
+    chromiumPackage = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.chromium;
+      defaultText = lib.literalExpression "pkgs.chromium";
+      description = ''
+        Chromium package used by the chromedp solver. Override if
+        you want to pin a specific Chromium build (e.g.
+        `pkgs.ungoogled-chromium` for fingerprint hardening, or
+        `pkgs.google-chrome` if you accept the proprietary build).
+        Ignored when `solver = "none"`.
+      '';
+    };
+
+    solverTtl = lib.mkOption {
+      type = lib.types.str;
+      default = "25m";
+      description = ''
+        How long to cache a (host, exit_ip) cookie bundle before
+        re-running the solver. Cookies are also dropped on every
+        rotation regardless of this value.
+      '';
+    };
+
+    solverTimeout = lib.mkOption {
+      type = lib.types.str;
+      default = "30s";
+      description = ''
+        Max time per Chromium solve (startup + navigation +
+        challenge wait + cookie extraction).
+      '';
     };
 
     logLevel = lib.mkOption {
@@ -214,6 +269,13 @@ in
         Group = "fauxbrowser";
 
         # Hardened sandbox. See systemd.exec(5).
+        # When solver = chromedp, Chromium needs:
+        #   - user namespaces (its renderer sandbox)
+        #   - to fork/exec helper processes
+        #   - AF_NETLINK for some platform integrations
+        # so we relax RestrictNamespaces and MemoryDenyWriteExecute
+        # in that mode, and add chromium to PATH so chromedp can
+        # exec it.
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;
@@ -229,12 +291,15 @@ in
         ProcSubset = "pid";
         RestrictSUIDSGID = true;
         RestrictRealtime = true;
-        RestrictNamespaces = true;
+        RestrictNamespaces = if cfg.solver == "chromedp" then false else true;
         LockPersonality = true;
-        MemoryDenyWriteExecute = true;
+        MemoryDenyWriteExecute = if cfg.solver == "chromedp" then false else true;
         SystemCallArchitectures = "native";
         SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
-        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+        RestrictAddressFamilies =
+          if cfg.solver == "chromedp"
+          then [ "AF_INET" "AF_INET6" "AF_UNIX" "AF_NETLINK" ]
+          else [ "AF_INET" "AF_INET6" "AF_UNIX" ];
         CapabilityBoundingSet = "";
         AmbientCapabilities = "";
         UMask = "0077";
@@ -247,6 +312,11 @@ in
         # Stop grace — give the reaper room to drain retired tunnels.
         TimeoutStopSec = "30s";
       };
+
+      # When the chromedp solver is enabled, give the unit access
+      # to the Chromium binary on PATH (chromedp invokes
+      # exec.LookPath internally if no absolute path is set).
+      path = lib.optional (cfg.solver == "chromedp") cfg.chromiumPackage;
     };
 
     networking.firewall = lib.mkIf cfg.openFirewall {

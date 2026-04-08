@@ -11,9 +11,9 @@
       # Go build output. Called per-system below.
       mkFauxbrowser = pkgs: pkgs.buildGoModule rec {
         pname = "fauxbrowser";
-        version = "0.5.0";
+        version = "0.7.0";
         src = ./.;
-        vendorHash = "sha256-sLh2+zcN1Dr6XJgB7xCOEINz4SK8Az9WZP8nYk2hh4Q=";
+        vendorHash = "sha256-IJQBeCjtTnTiipDq/ScexOnmZcmli94OvairWF7olFo=";
         subPackages = [ "cmd/fauxbrowser" ];
         ldflags = [
           "-s"
@@ -57,7 +57,11 @@
         checks.default = fauxbrowser;
 
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [ go gopls curl jq ];
+          # chromium is included for development + the optional
+          # chromedp WAF challenge solver. The fauxbrowser binary
+          # itself does NOT depend on chromium at build time —
+          # only at runtime, and only if -solver chromedp is set.
+          packages = with pkgs; [ go gopls curl jq chromium ];
         };
       })) // {
         # System-independent outputs.

@@ -171,6 +171,10 @@ empty `CapabilityBoundingSet`, `MemoryDenyWriteExecute=true`,
 -vpn-country           comma-separated ISO-2 country allow-list
 -vpn-continent         comma-separated continent allow-list        (EU,NA,AS,OC,SA,AF)
 -profile               browser profile                             (default chrome146)
+-solver                WAF challenge solver: none (default), chromedp
+-solver-ttl            cookie cache TTL per (host, exit_ip)        (default 25m)
+-solver-timeout        max time per Chromium solve                 (default 30s)
+-chromium-path         absolute Chromium binary path               (default = $PATH lookup)
 -auth-token            bearer token on the proxy listener          (MANDATORY for non-loopback)
 -admin-token           bearer token on the admin listener          (MANDATORY for non-loopback)
 -timeout               per-request upstream timeout, seconds       (default 60)
@@ -199,6 +203,75 @@ Supported: `chrome146` (default), `chrome144`, `chrome133`, `chrome131`,
 `latest` (= chrome146). Each entry pins the TLS fingerprint, the
 User-Agent, and the `sec-ch-ua` bundle together — a CI test asserts
 they all agree on the Chrome major version.
+
+### WAF challenge solver (optional, on-demand)
+
+For sites whose Cloudflare / Akamai / DataDome / PerimeterX / Imperva
+challenge isn't passable with the chrome146 header bundle alone,
+fauxbrowser can launch a real headless Chromium on demand to solve
+the challenge, extract the clearance cookies, cache them per
+`(host, exit_ip)`, and stamp them on subsequent fast-path requests
+for that host until rotation or TTL expiry.
+
+```sh
+./fauxbrowser -wg-conf /path/to/proton.conf \
+  -solver chromedp \
+  -solver-ttl 25m \
+  -solver-timeout 30s
+```
+
+The solver requires a `chromium` (or `google-chrome`) binary on
+`$PATH`, or pass an explicit path via `-chromium-path`. On NixOS the
+module pulls in `pkgs.chromium` automatically when
+`services.fauxbrowser.solver = "chromedp"` is set.
+
+**How it works**:
+
+1. fauxbrowser dispatches the request via the chrome146 fast path.
+2. If the response matches a known WAF challenge fingerprint
+   (`cf-mitigated`, `_abck=...~-1~`, `x-datadome`, etc.), the
+   solver fires.
+3. A fresh headless Chromium is launched (no warm pool — pay the
+   ~500ms startup cost on each new origin to keep memory pressure
+   to zero between solves).
+4. Chromium routes its traffic back through fauxbrowser's CONNECT
+   mode, which means **the solve happens via the same WireGuard
+   exit IP as the rest of the proxy**. This is the elegant
+   composition: cookies bound to (UA, exit_ip) are valid for
+   subsequent fauxbrowser requests because the exit IP is the same.
+5. Chromium runs with `--user-agent` set to the chrome146 profile's
+   UA so the cookies stay valid for the fast path.
+6. Once the clearance cookie appears in Chromium's cookie store,
+   the solver extracts cookies, caches them, and the original
+   fauxbrowser request is retried with the cookies stamped on.
+7. Subsequent requests to the same `(host, exit_ip)` skip the
+   solver entirely until the TTL expires or the rotator swaps to
+   a new exit IP.
+
+**Known limitation: cross-fingerprint cookie pinning.** A subset of
+CF customers (notably the more aggressive enterprise ones) bind
+`cf_clearance` to the JA3/JA4 TLS fingerprint of whoever solved
+it. Chromium's JA3 ≠ chrome146 tls-client's JA3, so for those
+sites the cookies don't transfer cleanly and the retry still gets
+403. fauxbrowser detects this case, invalidates the cache, and
+propagates the 4xx to the caller without entering an infinite
+loop. For sites where this happens, the solver doesn't help and
+the only solutions are (a) route ALL traffic for that host
+through Chromium directly (heavier, not yet built), or (b) pay
+for residential proxies. The solver IS effective for the larger
+class of sites that pin cookies to `(UA, IP)` only — most smaller
+CF customers, default Bot Fight Mode, etc.
+
+**Tradeoffs of running the solver**:
+
+- Adds a `chromium` binary dependency (~150 MB on disk).
+- Adds ~500ms-2s latency on the FIRST request to each new
+  challenged origin. Subsequent requests are zero-overhead
+  (cached cookies).
+- Bypasses the rotator's response heuristic for that retry — the
+  retry hits the same exit IP that just got challenged.
+- Per-host cookie cache survives across requests but is dropped
+  on rotation (cookies are exit-IP-bound).
 
 ## Rotation heuristics
 
