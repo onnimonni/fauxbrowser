@@ -3,13 +3,16 @@ package proxy
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	nurl "net/url"
 	"strings"
 	"sync"
+	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
+	"golang.org/x/net/proxy"
 
 	"github.com/onnimonni/fauxbrowser/internal/solver"
 )
@@ -34,6 +37,12 @@ type TransportOptions struct {
 	// own container and can't reach host-local addresses. Empty falls
 	// back to UpstreamProxy.
 	SolverEgress string
+
+	// CustomDialer, when non-nil, overrides all outbound dialing. Used
+	// to route upstream fetches through an embedded WireGuard tunnel.
+	// Mutually exclusive with UpstreamProxy at runtime: when CustomDialer
+	// is set, UpstreamProxy is ignored for fast-path dispatch.
+	CustomDialer proxy.ContextDialer
 }
 
 // Transport is an http.RoundTripper backed by a pool of tls-client clients,
@@ -132,7 +141,25 @@ func (t *Transport) buildClient(profile, session string) (tls_client.HttpClient,
 		tls_client.WithCookieJar(jar),
 		tls_client.WithRandomTLSExtensionOrder(),
 	}
-	if t.opts.UpstreamProxy != "" {
+	switch {
+	case t.opts.CustomDialer != nil:
+		// Custom dialer path (embedded WireGuard, netstack, etc.).
+		// tls-client has no direct "WithContextDialer" but its
+		// WithProxyDialerFactory hook fires whenever a factory is set,
+		// regardless of whether a proxy URL is present. We hand it a
+		// factory that ignores its inputs and returns our ContextDialer.
+		opts = append(opts,
+			tls_client.WithProxyDialerFactory(func(
+				_ string,
+				_ time.Duration,
+				_ *net.TCPAddr,
+				_ fhttp.Header,
+				_ tls_client.Logger,
+			) (proxy.ContextDialer, error) {
+				return t.opts.CustomDialer, nil
+			}),
+		)
+	case t.opts.UpstreamProxy != "":
 		opts = append(opts, tls_client.WithProxyUrl(t.opts.UpstreamProxy))
 	}
 	if t.opts.Insecure {

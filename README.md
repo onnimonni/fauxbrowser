@@ -21,6 +21,24 @@ Host-header and Header modes are the simplest — no CA, no cert install,
 works from anywhere. MITM mode is useful when you cannot change the
 client code (the client already speaks to an HTTP proxy with CONNECT).
 
+## What's new in v0.4.0
+
+- **Embedded userspace WireGuard.** Point fauxbrowser at any wg-quick
+  `.conf` file with `-wg-conf /path/to/vpn.conf` and it routes every
+  upstream fetch through a WireGuard tunnel built into the binary.
+  **No gluetun sidecar, no Docker, no `NET_ADMIN`, no `/dev/net/tun`,
+  no root, works identically on macOS and Linux.** Built on
+  `golang.zx2c4.com/wireguard` + gVisor netstack — exactly what
+  Tailscale's `tsnet` uses.
+- **Architectural kill switch.** When `-wg-conf` is active, every
+  tls-client dial goes through the tunnel's `ContextDialer`. If the
+  tunnel is down, connections fail closed — there's no secondary
+  dialer to leak the host IP. Strictly better than an iptables-based
+  kill switch because there's no rule to misconfigure.
+- **`-upstream` is now optional.** Use either an external HTTP proxy
+  (gluetun or anything else) or `-wg-conf` for the embedded tunnel.
+  If both are set, `-wg-conf` wins and a warning is logged.
+
 ## What's new in v0.3.0
 
 - **Pluggable WAF challenge solver.** When an upstream response looks like
@@ -113,6 +131,28 @@ curl http://127.0.0.1:18443/ \
   -H 'X-Fauxbrowser-Session: crawler-A'
 ```
 
+### Single-binary WireGuard (no gluetun, no Docker)
+
+fauxbrowser can embed a userspace WireGuard tunnel directly. Point it
+at any wg-quick `.conf` and every upstream fetch goes through the VPN:
+
+```sh
+./fauxbrowser \
+  -listen 127.0.0.1:18443 \
+  -wg-conf /path/to/your-vpn.conf
+
+# verify the exit IP is the WG peer
+curl http://127.0.0.1:18443/ -H 'X-Target-URL: https://ifconfig.me/ip'
+```
+
+Works on macOS and Linux with no root, no `NET_ADMIN`, no
+`/dev/net/tun`. ~20-30% slower than kernel WireGuard (gVisor netstack
+does the IP layer in userspace), which is irrelevant for a crawler.
+
+If `-wg-conf` is set, tls-client dials the origin via the tunnel only;
+there is no fallback path, so a dropped tunnel means failed connections
+rather than leaked IPs. That's the kill switch.
+
 ### Nix flake
 
 ```sh
@@ -156,6 +196,8 @@ Every flag has a matching `FAUXBROWSER_<UPPER>` env var (e.g.
 -listen            address to listen on                       (default 127.0.0.1:18443)
 -admin-listen      optional /healthz listener                  (empty = disabled)
 -upstream          upstream HTTP proxy URL (gluetun etc.)      (empty = direct)
+-wg-conf           path to a wg-quick .conf; embeds a userspace WireGuard tunnel
+                   (overrides -upstream; no gluetun/NET_ADMIN needed)
 -profile           default browser profile                     (default chrome146)
 -ca-cert / -ca-key path to existing CA PEMs                    (auto-generated if missing)
 -ca-out            persist auto-generated CA to basename.pem + .key
