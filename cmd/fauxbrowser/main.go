@@ -44,6 +44,7 @@ func run() error {
 	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "plaintext h2c listen address")
 	fs.StringVar(&cfg.AdminListen, "admin-listen", cfg.AdminListen, "optional admin listener (/healthz, /rotate)")
 	fs.StringVar(&cfg.WGConf, "wg-conf", cfg.WGConf, "path to a wg-quick .conf (only PrivateKey + Address/DNS are used; peer is picked from the Proton catalog)")
+	fs.StringVar(&cfg.WGPrivateKey, "wg-private-key", cfg.WGPrivateKey, "base64 WireGuard private key (alternative to -wg-conf; gluetun-style)")
 	fs.StringVar(&cfg.VPNTier, "vpn-tier", cfg.VPNTier, "server tier: free (default), paid|plus, or all")
 	fs.StringVar(&cfg.Profile, "profile", cfg.Profile, "browser profile: chrome146 (default), chrome144, chrome133, chrome131, or 'latest'")
 	var countriesFlag string
@@ -80,12 +81,27 @@ func run() error {
 		return err
 	}
 
-	if cfg.WGConf == "" {
-		return errors.New("-wg-conf is required (path to a Proton .conf with PrivateKey + Address/DNS)")
+	// Either -wg-conf (a wg-quick file path) or -wg-private-key
+	// (gluetun-style env, just the base64 key) is required.
+	if cfg.WGConf == "" && cfg.WGPrivateKey == "" {
+		return errors.New("either -wg-conf or -wg-private-key (or WIREGUARD_PRIVATE_KEY env) is required")
 	}
-	baseCfg, err := wgtunnel.LoadConfig(cfg.WGConf)
-	if err != nil {
-		return fmt.Errorf("load wg conf: %w", err)
+	var (
+		baseCfg *wgtunnel.Config
+		err     error
+	)
+	if cfg.WGConf != "" {
+		baseCfg, err = wgtunnel.LoadConfig(cfg.WGConf)
+		if err != nil {
+			return fmt.Errorf("load wg conf: %w", err)
+		}
+	} else {
+		baseCfg, err = wgtunnel.ConfigFromPrivateKey(cfg.WGPrivateKey)
+		if err != nil {
+			return fmt.Errorf("parse wg private key: %w", err)
+		}
+		slog.Info("WireGuard interface bootstrapped from private key only",
+			"address", "10.2.0.2/32", "dns", "10.2.0.1")
 	}
 	// The base conf's peer fields are DISCARDED — rotator picks peers
 	// from the Proton catalog. Wipe them to make that invariant loud.
@@ -160,6 +176,11 @@ func run() error {
 	base := proxy.NewHandler(proxy.Options{
 		TargetHeader: cfg.TargetHeader,
 		Transport:    transport,
+		// Same dialer used by the Transport — routes through the
+		// current WireGuard tunnel and honors per-host quarantine.
+		// CONNECT tunnels go through this directly, bypassing
+		// tls-client (the client speaks its own TLS to the target).
+		Dialer: rot.Dialer(),
 	})
 	// BearerAuth is a no-op when AuthToken is empty (loopback default).
 	// When bound to a non-loopback, safetyCheck has already refused to

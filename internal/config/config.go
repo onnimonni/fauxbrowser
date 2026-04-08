@@ -20,8 +20,10 @@ type Config struct {
 
 	// WireGuard base conf: private key, interface address, DNS, MTU.
 	// Peer fields are ignored — the rotator supplies them from the
-	// Proton catalog.
-	WGConf string
+	// Proton catalog. Provide EITHER WGConf (path to a wg-quick .conf)
+	// OR WGPrivateKey (just the base64 private key, gluetun-style).
+	WGConf       string
+	WGPrivateKey string
 
 	// Proton server filter.
 	VPNTier       string   // "free" (default), "paid"/"plus", "all"
@@ -81,14 +83,37 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("FAUXBROWSER_WG_CONF"); v != "" {
 		c.WGConf = v
 	}
+	if v := os.Getenv("FAUXBROWSER_WG_PRIVATE_KEY"); v != "" {
+		c.WGPrivateKey = v
+	}
+	// Gluetun-compatible alias.
+	if v := os.Getenv("WIREGUARD_PRIVATE_KEY"); v != "" {
+		c.WGPrivateKey = v
+	}
 	if v := os.Getenv("FAUXBROWSER_VPN_TIER"); v != "" {
 		c.VPNTier = v
+	}
+	// Gluetun-compatible alias: FREE_ONLY=on/true/1 → tier=free.
+	if v := strings.ToLower(os.Getenv("FREE_ONLY")); v != "" {
+		switch v {
+		case "1", "true", "on", "yes":
+			c.VPNTier = "free"
+		case "0", "false", "off", "no":
+			// Don't restrict tier; let the user pick via VPN_TIER or
+			// the default. Leaving as-is is the right behavior.
+		}
 	}
 	if v := os.Getenv("FAUXBROWSER_PROFILE"); v != "" {
 		c.Profile = v
 	}
 	if v := os.Getenv("FAUXBROWSER_VPN_COUNTRIES"); v != "" {
 		c.VPNCountries = SplitCSV(v)
+	}
+	// Gluetun-compatible alias. Supports both ISO-2 codes ("NL,DE") and
+	// country names ("Netherlands,Germany"). Names are translated via
+	// the SERVER_COUNTRIES → ISO map.
+	if v := os.Getenv("SERVER_COUNTRIES"); v != "" {
+		c.VPNCountries = ResolveCountryNames(SplitCSV(v))
 	}
 	if v := os.Getenv("FAUXBROWSER_VPN_CONTINENTS"); v != "" {
 		c.VPNContinents = SplitCSV(v)
@@ -106,6 +131,60 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("FAUXBROWSER_LOG_LEVEL"); v != "" {
 		c.LogLevel = v
 	}
+}
+
+// countryNameToISO maps the country names that gluetun's SERVER_COUNTRIES
+// env var accepts to their ISO-3166-1 alpha-2 codes. Only the countries
+// where Proton actually offers servers are exhaustively listed; the
+// rest fall through and any input that already looks like an ISO code
+// is passed through verbatim.
+var countryNameToISO = map[string]string{
+	"netherlands":    "NL",
+	"germany":        "DE",
+	"switzerland":    "CH",
+	"romania":        "RO",
+	"japan":          "JP",
+	"united states":  "US",
+	"usa":            "US",
+	"canada":         "CA",
+	"mexico":         "MX",
+	"singapore":      "SG",
+	"norway":         "NO",
+	"poland":         "PL",
+	"france":         "FR",
+	"united kingdom": "GB",
+	"uk":             "GB",
+	"italy":          "IT",
+	"spain":          "ES",
+	"sweden":         "SE",
+	"finland":        "FI",
+	"denmark":        "DK",
+	"belgium":        "BE",
+	"austria":        "AT",
+	"czech republic": "CZ",
+	"czechia":        "CZ",
+}
+
+// ResolveCountryNames maps a list of country names or ISO codes to a
+// list of ISO codes. Two-character entries are passed through (assumed
+// to already be ISO codes). Longer entries are looked up in
+// countryNameToISO; unknown names are dropped.
+func ResolveCountryNames(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if len(s) == 2 {
+			out = append(out, strings.ToUpper(s))
+			continue
+		}
+		if iso, ok := countryNameToISO[strings.ToLower(s)]; ok {
+			out = append(out, iso)
+		}
+	}
+	return out
 }
 
 func SplitCSV(s string) []string {

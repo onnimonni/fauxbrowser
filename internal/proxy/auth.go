@@ -20,9 +20,13 @@ import (
 
 // BearerAuth wraps h with a bearer-token check. If token is empty, the
 // returned handler is h unchanged (auth disabled). Non-empty tokens
-// require every request to present
-// "Authorization: Bearer <token>" — any other value (missing, wrong
-// scheme, wrong value) returns 401.
+// require every request to present a bearer credential in either
+// `Authorization: Bearer <token>` (the API mode) OR
+// `Proxy-Authorization: Bearer <token>` (the HTTP_PROXY/CONNECT mode).
+//
+// On failure, CONNECT requests get 407 Proxy Authentication Required
+// (with Proxy-Authenticate); everything else gets 401 Unauthorized
+// (with WWW-Authenticate).
 func BearerAuth(h http.Handler, token string) http.Handler {
 	if token == "" {
 		return h
@@ -30,7 +34,15 @@ func BearerAuth(h http.Handler, token string) http.Handler {
 	want := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := extractBearer(r.Header.Get("Authorization"))
+		if got == "" {
+			got = extractBearer(r.Header.Get("Proxy-Authorization"))
+		}
 		if got == "" || subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+			if r.Method == http.MethodConnect {
+				w.Header().Set("Proxy-Authenticate", `Bearer realm="fauxbrowser"`)
+				http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
+				return
+			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="fauxbrowser"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
