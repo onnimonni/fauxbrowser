@@ -21,6 +21,31 @@ Host-header and Header modes are the simplest — no CA, no cert install,
 works from anywhere. MITM mode is useful when you cannot change the
 client code (the client already speaks to an HTTP proxy with CONNECT).
 
+## What's new in v0.3.0
+
+- **Pluggable WAF challenge solver.** When an upstream response looks like
+  a JS-based bot gate (Cloudflare IUAM/Turnstile, DataDome, PerimeterX),
+  fauxbrowser can dispatch a real headless browser via a configurable
+  solver backend, cache the resulting cookies + UA per (session, domain),
+  and re-fetch via the fast tls-client path. One slow solve per origin;
+  everything else stays on the streaming path.
+- **FlareSolverr solver built in.** Ships with a minimal MIT-licensed
+  JSON client for [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr),
+  so adding JS-challenge bypass is a single flag + a sidecar container.
+- **Forced browser-fingerprint headers.** `User-Agent`, `sec-ch-ua`,
+  `sec-ch-ua-mobile` and `sec-ch-ua-platform` are now *always* set from
+  the active TLS profile — sending Chrome 131 over the wire with a
+  Chrome 146 TLS handshake desynced the forgery, and
+  [`~/.curlrc`](https://curl.se/docs/manpage.html#-K) defaults were
+  leaking into the upstream request. Fauxbrowser now enforces a
+  consistent fingerprint bundle on every upstream fetch.
+- **Proactive cookie stamping.** The solver cache is consulted on every
+  request (not only after a challenge), so repeat hits to a previously
+  solved domain never re-solve.
+- **Verified against k-ruoka.fi** (Cloudflare IUAM + UA-based client
+  browser version gate) — both the solved-with-FlareSolverr path and
+  the no-solver "correct headers were enough" path return real content.
+
 ## What's new in v0.2.0
 
 - **Streaming everything**. The whole upstream path is a custom
@@ -142,6 +167,10 @@ Every flag has a matching `FAUXBROWSER_<UPPER>` env var (e.g.
 -session-max       max concurrent tls-client sessions          (default 256)
 -timeout           per-request upstream timeout seconds        (default 60)
 -log-level         debug|info|warn|error                       (default info)
+-solver            WAF challenge solver backend                (empty|flaresolverr)
+-solver-url        URL of the solver backend                   (e.g. http://127.0.0.1:8191)
+-solver-egress     HTTP proxy URL the solver should egress via (defaults to -upstream)
+-solver-ttl        how long to reuse solved cookies            (default 25m)
 -version           print version and exit
 ```
 
@@ -159,6 +188,47 @@ opera_90
 
 Shortcuts: `chrome` / `latest` → chrome146, `firefox` → firefox147,
 `safari` → safari16, `opera` → opera_90.
+
+### WAF JS challenge solver
+
+For sites protected by a JavaScript bot gate that pure TLS forging cannot
+beat (Cloudflare IUAM/Turnstile, DataDome, PerimeterX), fauxbrowser can
+delegate to an external headless-browser service. Only challenged
+responses trigger a solve, and the result is cached per
+(session, domain) for `-solver-ttl` (default 25 minutes) so repeat hits
+stay on the fast streaming path.
+
+```sh
+# 1. Run FlareSolverr as a sidecar. For the solved cf_clearance to remain
+#    valid, FlareSolverr MUST egress via the same IP as fauxbrowser — in
+#    practice that means sharing gluetun's network namespace (see the
+#    docker-compose in this repo).
+docker run -d --rm --name flaresolverr -p 127.0.0.1:8191:8191 \
+  ghcr.io/flaresolverr/flaresolverr:latest
+
+# 2. Point fauxbrowser at it.
+./fauxbrowser \
+  -listen 127.0.0.1:18443 \
+  -upstream http://127.0.0.1:18888 \
+  -solver flaresolverr \
+  -solver-url http://127.0.0.1:8191 \
+  -solver-egress http://127.0.0.1:18888
+
+# 3. Requests that hit a CF IUAM page now solve transparently.
+curl http://127.0.0.1:18443/ -H 'X-Target-URL: https://some-cf-protected-site/' \
+                             -H 'X-Fauxbrowser-Session: crawler-A'
+```
+
+**Important**: often the solver does not even need to fire. Once
+fauxbrowser forces a consistent TLS profile + User-Agent + Client-Hints
+bundle, many sites that previously returned a challenge let the request
+straight through. Verified against k-ruoka.fi (Cloudflare IUAM +
+`sec-ch-ua` version gate): real content returned on first hit with no
+solver dispatch.
+
+The FlareSolverr client is a tiny MIT-licensed JSON client we ship
+in-tree at `internal/solver/flaresolverr/` — it is not the external
+GPL-3.0 community binding, so fauxbrowser stays MIT.
 
 ### Safety defaults
 
