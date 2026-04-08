@@ -1,3 +1,6 @@
+# Playwright MCP artifacts
+.playwright-mcp/
+
 # Devenv
 .devenv*
 devenv.local.nix

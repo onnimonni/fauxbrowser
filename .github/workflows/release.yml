@@ -1,0 +1,145 @@
+name: release
+
+# Cross-compiles fauxbrowser for 4 platforms and attaches the binaries
+# to a GitHub release whenever an annotated tag matching v*.*.* is
+# pushed. Run tests first so a broken tag never ships.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write  # needed to create/edit releases
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          out="fauxbrowser-${VERSION}-${GOOS}-${GOARCH}"
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "${out}" \
+            ./cmd/fauxbrowser
+          sha256sum "${out}" > "${out}.sha256"
+          ls -la "${out}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fauxbrowser-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            fauxbrowser-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+            fauxbrowser-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need the full history so annotated tag body is visible
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine SHA256SUMS
+        working-directory: dist
+        run: |
+          cat *.sha256 > SHA256SUMS
+          rm -f *.sha256
+          ls -la
+
+      - name: Extract tag message
+        id: tagmsg
+        run: |
+          # Prefer the annotated tag body if present; otherwise fall
+          # back to "tag: <tag>". The workflow uses this as the release
+          # body preamble, then appends the canonical install snippet.
+          body="$(git tag -l --format='%(contents:body)' "${{ github.ref_name }}")"
+          if [ -z "${body}" ]; then
+            body="$(git tag -l --format='%(contents)' "${{ github.ref_name }}")"
+          fi
+          {
+            echo 'body<<TAGMSG_EOF'
+            echo "${body}"
+            echo ''
+            echo '---'
+            echo ''
+            echo '## Install — NixOS flake'
+            echo ''
+            echo '```nix'
+            echo '{'
+            echo '  inputs.fauxbrowser.url = "github:onnimonni/fauxbrowser/${{ github.ref_name }}";'
+            echo '  outputs = { self, nixpkgs, fauxbrowser, ... }: {'
+            echo '    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {'
+            echo '      system = "x86_64-linux";'
+            echo '      modules = ['
+            echo '        fauxbrowser.nixosModules.default'
+            echo '        { services.fauxbrowser = { enable = true; wgConfFile = "/run/secrets/proton-vpn.conf"; vpnCountries = [ "NL" "DE" ]; }; }'
+            echo '      ];'
+            echo '    };'
+            echo '  };'
+            echo '}'
+            echo '```'
+            echo ''
+            echo '## Install — prebuilt binary'
+            echo ''
+            echo 'Verify with `SHA256SUMS`. Built with `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}"`.'
+            echo 'TAGMSG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.tagmsg.outputs.body }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/fauxbrowser-${{ github.ref_name }}-linux-amd64
+            dist/fauxbrowser-${{ github.ref_name }}-linux-arm64
+            dist/fauxbrowser-${{ github.ref_name }}-darwin-amd64
+            dist/fauxbrowser-${{ github.ref_name }}-darwin-arm64
+            dist/SHA256SUMS

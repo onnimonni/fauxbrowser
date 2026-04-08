@@ -1,351 +1,240 @@
 # fauxbrowser
 
-Tiny HTTP proxy that forges browser TLS fingerprints for `curl` or any
-HTTP client. Internally it re-issues every request through
-[bogdanfinn/tls-client](https://github.com/bogdanfinn/tls-client) (a
-patched utls fork) so the outgoing TLS handshake, JA3/JA4 fingerprint,
-and default header set all match a real Chrome / Firefox / Safari build.
-Optionally chains through an upstream HTTP proxy such as
-[qdm12/gluetun](https://github.com/qdm12/gluetun) so every egress exits
-via a WireGuard / OpenVPN tunnel.
+Single-binary HTTP proxy for crawlers. Every outbound request:
 
-## Three ways to talk to it
+1. Egresses through an embedded ProtonVPN WireGuard tunnel (userspace
+   wireguard-go + gVisor netstack — no `NET_ADMIN`, no `/dev/net/tun`,
+   no root).
+2. Forges a Chrome TLS fingerprint on the wire via
+   [bogdanfinn/tls-client](https://github.com/bogdanfinn/tls-client).
+3. Rotates the exit IP on `429` or WAF-challenge `403`/`503`
+   (Cloudflare, DataDome, Akamai, Sucuri). Rotation is **per-host
+   blue/green**: the flagged host's traffic is buffered while a new
+   tunnel is built in parallel; other hosts keep flowing on the old
+   tunnel until it drains.
 
-| Mode             | Client invocation                                                | CA trust |
-|------------------|------------------------------------------------------------------|----------|
-| Header mode      | `curl http://proxy -H 'X-Target-URL: https://target/path'`       | no       |
-| Host-header mode | `curl http://proxy/path -H 'Host: target'`                       | no       |
-| MITM mode        | `curl -x http://proxy --cacert ca.pem https://target/path`       | yes      |
-
-Host-header and Header modes are the simplest — no CA, no cert install,
-works from anywhere. MITM mode is useful when you cannot change the
-client code (the client already speaks to an HTTP proxy with CONNECT).
-
-## What's new in v0.4.0
-
-- **Embedded userspace WireGuard.** Point fauxbrowser at any wg-quick
-  `.conf` file with `-wg-conf /path/to/vpn.conf` and it routes every
-  upstream fetch through a WireGuard tunnel built into the binary.
-  **No gluetun sidecar, no Docker, no `NET_ADMIN`, no `/dev/net/tun`,
-  no root, works identically on macOS and Linux.** Built on
-  `golang.zx2c4.com/wireguard` + gVisor netstack — exactly what
-  Tailscale's `tsnet` uses.
-- **Architectural kill switch.** When `-wg-conf` is active, every
-  tls-client dial goes through the tunnel's `ContextDialer`. If the
-  tunnel is down, connections fail closed — there's no secondary
-  dialer to leak the host IP. Strictly better than an iptables-based
-  kill switch because there's no rule to misconfigure.
-- **`-upstream` is now optional.** Use either an external HTTP proxy
-  (gluetun or anything else) or `-wg-conf` for the embedded tunnel.
-  If both are set, `-wg-conf` wins and a warning is logged.
-
-## What's new in v0.3.0
-
-- **Pluggable WAF challenge solver.** When an upstream response looks like
-  a JS-based bot gate (Cloudflare IUAM/Turnstile, DataDome, PerimeterX),
-  fauxbrowser can dispatch a real headless browser via a configurable
-  solver backend, cache the resulting cookies + UA per (session, domain),
-  and re-fetch via the fast tls-client path. One slow solve per origin;
-  everything else stays on the streaming path.
-- **FlareSolverr solver built in.** Ships with a minimal MIT-licensed
-  JSON client for [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr),
-  so adding JS-challenge bypass is a single flag + a sidecar container.
-- **Forced browser-fingerprint headers.** `User-Agent`, `sec-ch-ua`,
-  `sec-ch-ua-mobile` and `sec-ch-ua-platform` are now *always* set from
-  the active TLS profile — sending Chrome 131 over the wire with a
-  Chrome 146 TLS handshake desynced the forgery, and
-  [`~/.curlrc`](https://curl.se/docs/manpage.html#-K) defaults were
-  leaking into the upstream request. Fauxbrowser now enforces a
-  consistent fingerprint bundle on every upstream fetch.
-- **Proactive cookie stamping.** The solver cache is consulted on every
-  request (not only after a challenge), so repeat hits to a previously
-  solved domain never re-solve.
-- **Verified against k-ruoka.fi** (Cloudflare IUAM + UA-based client
-  browser version gate) — both the solved-with-FlareSolverr path and
-  the no-solver "correct headers were enough" path return real content.
-
-## What's new in v0.2.0
-
-- **Streaming everything**. The whole upstream path is a custom
-  `http.RoundTripper` feeding `net/http/httputil.ReverseProxy`. Large
-  downloads no longer buffer in memory; a 1 GB download uses ~1 MB of
-  RSS.
-- **HTTP/2 + WebSocket through MITM**. The MITM TLS listener advertises
-  `h2` via ALPN and is served by the standard `net/http` server, so
-  keep-alive, chunked encoding, trailers, and Upgrade-based protocols
-  all work end-to-end.
-- **Per-request profile + session isolation** via `X-Fauxbrowser-Profile`
-  and `X-Fauxbrowser-Session` headers. Cookies are neutral by default
-  (no jar); a jar is created per-session when the session header is set.
-- **Context cancellation**. Upstream fetches abort within ~1 s of the
-  client disconnecting.
-- **Proxy-Authorization Basic** auth and optional **host allow-list**.
-- **Graceful shutdown** on SIGINT / SIGTERM with a 15 s drain.
-- **CA hygiene**: random 128-bit serial, SKI/AKI, path-length cap,
-  397-day leaves, LRU-bounded leaf cache with singleflight.
-- **Browser-plausible default headers** (User-Agent, Accept,
-  Accept-Language, Accept-Encoding) auto-injected when the caller
-  doesn't set them, so sites like `k-ruoka.fi` that check for
-  "outdated browser" UA don't reject us at the door.
-- **Tests + CI**. `go test -race ./...` covers CA round-trip,
-  leaf-cache concurrency, self-host detection, and an end-to-end
-  httptest origin exercised through all three modes.
+The listener speaks plaintext **HTTP/1.1 and h2c (HTTP/2 cleartext)
+on the same port**, so an Elixir Mint/Finch worker can open one TCP
+connection and multiplex requests.
 
 ## Quick start
 
-### Native (devenv / Go)
-
 ```sh
-devenv shell
 go build -o fauxbrowser ./cmd/fauxbrowser
 
-# direct (no VPN), ephemeral CA
-./fauxbrowser -listen 127.0.0.1:18443
+# default: any free Proton server, any country
+./fauxbrowser -wg-conf /path/to/proton.conf
 
-# via gluetun VPN tunnel
-./fauxbrowser -listen 127.0.0.1:18443 -upstream http://127.0.0.1:18888
+# lock to specific countries
+./fauxbrowser -wg-conf /path/to/proton.conf -vpn-country NL,DE,CH
 
-# header mode — no CA trust
-curl http://127.0.0.1:18443/ -H 'X-Target-URL: https://www.proshop.dk/'
+# lock to a continent
+./fauxbrowser -wg-conf /path/to/proton.conf -vpn-continent EU
 
-# Host-header mode — no CA trust
-curl -H 'Host: www.proshop.dk' http://127.0.0.1:18443/Grafikkort
-
-# MITM mode — persist a CA so curl can trust it across runs
-./fauxbrowser -ca-out ca
-curl -x http://127.0.0.1:18443 --cacert ca.pem https://www.proshop.dk/
-```
-
-### Per-request overrides
-
-```sh
-# fresh session with its own cookie jar, using Firefox 147
-curl http://127.0.0.1:18443/ \
-  -H 'X-Target-URL: https://httpbin.org/cookies/set?a=1' \
-  -H 'X-Fauxbrowser-Profile: firefox147' \
-  -H 'X-Fauxbrowser-Session: crawler-A'
-
-# second request reuses the same jar
-curl http://127.0.0.1:18443/ \
-  -H 'X-Target-URL: https://httpbin.org/cookies' \
-  -H 'X-Fauxbrowser-Session: crawler-A'
-```
-
-### Single-binary WireGuard (no gluetun, no Docker)
-
-fauxbrowser can embed a userspace WireGuard tunnel directly. Point it
-at any wg-quick `.conf` and every upstream fetch goes through the VPN:
-
-```sh
-./fauxbrowser \
+# with admin listener for /healthz and POST /rotate
+./fauxbrowser -wg-conf /path/to/proton.conf \
   -listen 127.0.0.1:18443 \
-  -wg-conf /path/to/your-vpn.conf
-
-# verify the exit IP is the WG peer
-curl http://127.0.0.1:18443/ -H 'X-Target-URL: https://ifconfig.me/ip'
+  -admin-listen 127.0.0.1:18444
 ```
 
-Works on macOS and Linux with no root, no `NET_ADMIN`, no
-`/dev/net/tun`. ~20-30% slower than kernel WireGuard (gVisor netstack
-does the IP layer in userspace), which is irrelevant for a crawler.
+## Client invocation
 
-If `-wg-conf` is set, tls-client dials the origin via the tunnel only;
-there is no fallback path, so a dropped tunnel means failed connections
-rather than leaked IPs. That's the kill switch.
-
-### Nix flake
+Two request modes:
 
 ```sh
-nix run github:onnimonni/fauxbrowser -- -listen 127.0.0.1:18443
-# or from a checkout
-nix build .#fauxbrowser
-./result/bin/fauxbrowser --help
+# 1. X-Target-URL header
+curl http://127.0.0.1:18443/ -H 'X-Target-URL: https://example.com/path'
+
+# 2. Classic forward-proxy
+curl -x http://127.0.0.1:18443 http://example.com/path
 ```
 
-The flake exposes `packages.default`, `apps.default`, `checks.default`
-(runs the full test suite), and a `devShells.default` with Go + curl.
-
-### Docker / OCI
+HTTP/2 cleartext over a single TCP connection:
 
 ```sh
-docker build -t fauxbrowser:latest --build-arg VERSION=$(git rev-parse --short HEAD) .
-docker run --rm -p 127.0.0.1:18443:18443 fauxbrowser:latest
+curl --http2-prior-knowledge -H 'X-Target-URL: https://example.com/' \
+  http://127.0.0.1:18443/
 ```
 
-### docker-compose with gluetun (VPN kill-switch egress)
+CONNECT is **not** supported — fauxbrowser is a forwarder, not a
+tunnel. Pass the target URL and let fauxbrowser do the TLS.
 
-```sh
-cp .env.example .env
-# fill .env with YOUR WireGuard values
-docker compose up -d
-curl http://127.0.0.1:18443/ -H 'X-Target-URL: https://ifconfig.me/ip'
-# → VPN exit IP, not your real IP
+### From Elixir (Mint / Finch)
+
+```elixir
+{:ok, conn} = Mint.HTTP.connect(:http, "127.0.0.1", 18443, protocols: [:http2])
+{:ok, conn, ref} =
+  Mint.HTTP.request(conn, "GET", "/", [
+    {"x-target-url", "https://example.com/"}
+  ], nil)
 ```
 
-fauxbrowser runs inside gluetun's network namespace so every egress
-exits via the VPN. If gluetun's tunnel goes down, gluetun's internal
-firewall blocks all fauxbrowser traffic (kill-switch). Never commit
-`.env` or `*.conf`; `.gitignore` excludes them.
+## Install on NixOS
 
-## Flags and env vars
+The flake ships `nixosModules.default` + an overlay:
 
-Every flag has a matching `FAUXBROWSER_<UPPER>` env var (e.g.
-`FAUXBROWSER_UPSTREAM`, `FAUXBROWSER_PROFILE`, `FAUXBROWSER_AUTH`).
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    fauxbrowser = {
+      url = "github:onnimonni/fauxbrowser";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { self, nixpkgs, fauxbrowser, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        fauxbrowser.nixosModules.default
+        ({ ... }: {
+          services.fauxbrowser = {
+            enable = true;
+            wgConfFile = "/run/secrets/proton-vpn.conf";  # sops-nix / agenix
+            vpnCountries = [ "NL" "DE" ];
+          };
+        })
+      ];
+    };
+  };
+}
+```
+
+The systemd unit is hardened (`DynamicUser=true`, `ProtectSystem=strict`,
+empty `CapabilityBoundingSet`, `MemoryDenyWriteExecute=true`,
+`LoadCredential` for secret tokens).
+
+## Flags
 
 ```
--listen            address to listen on                       (default 127.0.0.1:18443)
--admin-listen      optional /healthz listener                  (empty = disabled)
--upstream          upstream HTTP proxy URL (gluetun etc.)      (empty = direct)
--wg-conf           path to a wg-quick .conf; embeds a userspace WireGuard tunnel
-                   (overrides -upstream; no gluetun/NET_ADMIN needed)
--profile           default browser profile                     (default chrome146)
--ca-cert / -ca-key path to existing CA PEMs                    (auto-generated if missing)
--ca-out            persist auto-generated CA to basename.pem + .key
--target-header     header carrying the target URL              (default X-Target-URL)
--auth              Proxy-Authorization Basic "user:pass"       (required for non-loopback)
--allow-hosts       comma-separated host glob allow-list        (empty = any)
--allow-open        allow non-loopback listen without -auth     (DANGEROUS)
--leaf-cache-max    max cached MITM leaf certs                  (default 1024)
--session-max       max concurrent tls-client sessions          (default 256)
--timeout           per-request upstream timeout seconds        (default 60)
--log-level         debug|info|warn|error                       (default info)
--solver            WAF challenge solver backend                (empty|flaresolverr)
--solver-url        URL of the solver backend                   (e.g. http://127.0.0.1:8191)
--solver-egress     HTTP proxy URL the solver should egress via (defaults to -upstream)
--solver-ttl        how long to reuse solved cookies            (default 25m)
--version           print version and exit
+-listen                h2c+h1 listen address                       (default 127.0.0.1:18443)
+-admin-listen          optional /healthz + /rotate listener        (empty = disabled)
+-wg-conf               path to a wg-quick .conf (REQUIRED)
+-vpn-tier              free (default) | paid | all
+-vpn-country           comma-separated ISO-2 country allow-list
+-vpn-continent         comma-separated continent allow-list        (EU,NA,AS,OC,SA,AF)
+-profile               browser profile                             (default chrome146)
+-auth-token            bearer token on the proxy listener          (MANDATORY for non-loopback)
+-admin-token           bearer token on the admin listener          (MANDATORY for non-loopback)
+-timeout               per-request upstream timeout, seconds       (default 60)
+-cooldown              per-server taint cooldown, seconds          (default 900)
+-handshake-wait        max WG handshake wait per rotation attempt  (default 6s)
+-host-debounce         per-host rotation debounce window           (default 5m)
+-rotation-min-interval global min between any two rotations        (default 2s)
+-retire-max-age        force-close retired tunnels past this age   (default 2m)
+-reaper-interval       how often the reaper scans                  (default 5s)
+-log-level             debug|info|warn|error                       (default info)
 ```
+
+Every flag also reads from `FAUXBROWSER_<UPPER>` env vars, e.g.
+`FAUXBROWSER_AUTH_TOKEN`, `FAUXBROWSER_PROFILE`.
+
+### Bearer auth
+
+- Default deployment is on `127.0.0.1`, no auth required.
+- Binding either listener to a non-loopback address refuses to start
+  without a corresponding token set. Requests must send
+  `Authorization: Bearer <token>`; comparison is constant-time.
 
 ### Browser profiles
 
-Default is **chrome146** — the latest Chrome fingerprint shipped in
-bogdanfinn/tls-client v1.14.0. Supported aliases:
+Supported: `chrome146` (default), `chrome144`, `chrome133`, `chrome131`,
+`latest` (= chrome146). Each entry pins the TLS fingerprint, the
+User-Agent, and the `sec-ch-ua` bundle together — a CI test asserts
+they all agree on the Chrome major version.
 
-```
-chrome146 | chrome144 | chrome133 | chrome131 | chrome124 | chrome120 | chrome117
-firefox147 | firefox135 | firefox133 | firefox123 | firefox117
-safari16 | safari_ios_18_5 | safari_ios_16_0 | safari_ios_15_5
-opera_90
-```
+## Rotation heuristics
 
-Shortcuts: `chrome` / `latest` → chrome146, `firefox` → firefox147,
-`safari` → safari16, `opera` → opera_90.
+| Status | Rotate? |
+|--------|---------|
+| `429`  | Always |
+| `403`  | Only with `cf-mitigated`, `server: cloudflare`, `x-datadome`, `x-iinfo`/`server: akamai`, `x-sucuri-id` |
+| `503`  | Only with the same WAF markers |
+| other  | Never |
 
-### WAF JS challenge solver
+Plain `401` / `403` (auth, geo-block) do **not** burn an IP.
 
-For sites protected by a JavaScript bot gate that pure TLS forging cannot
-beat (Cloudflare IUAM/Turnstile, DataDome, PerimeterX), fauxbrowser can
-delegate to an external headless-browser service. Only challenged
-responses trigger a solve, and the result is cached per
-(session, domain) for `-solver-ttl` (default 25 minutes) so repeat hits
-stay on the fast streaming path.
+### Blue/green per-host rotation
 
-```sh
-# 1. Run FlareSolverr as a sidecar. For the solved cf_clearance to remain
-#    valid, FlareSolverr MUST egress via the same IP as fauxbrowser — in
-#    practice that means sharing gluetun's network namespace (see the
-#    docker-compose in this repo).
-docker run -d --rm --name flaresolverr -p 127.0.0.1:8191:8191 \
-  ghcr.io/flaresolverr/flaresolverr:latest
+When a rotation is triggered:
 
-# 2. Point fauxbrowser at it.
-./fauxbrowser \
-  -listen 127.0.0.1:18443 \
-  -upstream http://127.0.0.1:18888 \
-  -solver flaresolverr \
-  -solver-url http://127.0.0.1:8191 \
-  -solver-egress http://127.0.0.1:18888
+1. The flagged host is quarantined — new requests to it wait on a
+   gate. Other hosts keep flowing on the current tunnel.
+2. A new tunnel is built in parallel (pick peer → handshake →
+   liveness probe). Once live, it becomes the new current.
+3. The quarantine lifts; buffered requests drain through the new
+   tunnel. All subsequent requests (to any host) also use it.
+4. The old tunnel is marked retiring. The reaper closes it once its
+   in-flight counter reaches zero, or after `-retire-max-age` as a
+   backstop.
+5. If the same host is hit again within `-host-debounce`, fauxbrowser
+   refuses to rotate again — the upstream response passes through
+   unchanged. This prevents concurrent bursts of 429s from burning
+   the Proton pool.
 
-# 3. Requests that hit a CF IUAM page now solve transparently.
-curl http://127.0.0.1:18443/ -H 'X-Target-URL: https://some-cf-protected-site/' \
-                             -H 'X-Fauxbrowser-Session: crawler-A'
-```
+## Cookie policy
 
-**Important**: often the solver does not even need to fire. Once
-fauxbrowser forces a consistent TLS profile + User-Agent + Client-Hints
-bundle, many sites that previously returned a challenge let the request
-straight through. Verified against k-ruoka.fi (Cloudflare IUAM +
-`sec-ch-ua` version gate): real content returned on first hit with no
-solver dispatch.
-
-The FlareSolverr client is a tiny MIT-licensed JSON client we ship
-in-tree at `internal/solver/flaresolverr/` — it is not the external
-GPL-3.0 community binding, so fauxbrowser stays MIT.
-
-### Safety defaults
-
-If you bind fauxbrowser to anything other than loopback, it will refuse
-to start without either `-auth user:pass` or the explicit `-allow-open`
-escape hatch — this prevents accidentally running an open fingerprint-
-forging proxy on a public interface. The docker-compose stack sets
-`FAUXBROWSER_ALLOW_OPEN=1` because it's bound to the gluetun netns
-internally, but you can (and should) also set `FAUXBROWSER_AUTH`.
+- Internal cookie jar persists `Set-Cookie` responses across requests
+  to the same host.
+- On rotation, the jar is cleared so nothing bound to the old exit IP
+  leaks.
+- Caller-supplied `Cookie:` headers on incoming requests are always
+  forwarded verbatim. Those are "the client's cookies" — fauxbrowser
+  only manages its own jar.
 
 ## Architecture
 
 ```
-          ┌──────────────────────────── fauxbrowser ────────────────────────────┐
-curl ───► │  CONNECT ─┐                                                         │ ───► target
-          │           ▼                                                         │
-          │       ┌───MITM───┐ in-mem  ┌───── http.Server (h1/h2) ─────┐        │
-          │       │ tls.Conn │ ────►   │  handler = ReverseProxy       │  ──┐   │
-          │       └──────────┘         └───────────────────────────────┘    │   │
-          │                                                                 │   │
-          │   X-Target-URL ────────────┐                                    │   │
-          │   Host: name ──────────────┼────►  front door rewrites r.URL    │   │
-          │   absolute URI ────────────┘       and delegates ...────────────┘   │
-          │                                                                     │
-          │                      ┌───► Transport.RoundTrip                      │
-          │                      │         • pool keyed by (profile, session)   │
-          │                      │         • fhttp request w/ r.Context()       │
-          │                      │         • streaming body                     │
-          │                      │         • hop-by-hop header scrub            │
-          │                      │         • browser default headers            │
-          │                      └───► bogdanfinn/tls-client (real TLS) ────────┘
-          └───────────────────────────────────────────────────────────────────────┘
+┌────────── fauxbrowser ──────────────────────────────────────────┐
+│                                                                 │
+│ Elixir ──► h2c listener ──► NewHandler ──► ReverseProxy ──► Transport
+│            (plaintext,                                     │
+│             HTTP/1.1 +                                     ▼
+│             h2 multiplexed)                         tls-client (chrome146)
+│                                                           │
+│                                                           ▼
+│                                                  rotator.Dialer  ◄── RotateIfTriggered(429/403/503)
+│                                                           │
+│                                                           ▼
+│                                       wgtunnel (userspace wg + netstack)
+│                                                           │
+└───────────────────────────────────────────────────────────┼──── Proton WG peer
+                                                            │
+                                                            ▼
+                                                          target
 ```
 
-- **One in-memory listener** receives every `*tls.Conn` accepted by the
-  MITM CONNECT handlers. One shared `http.Server` (with `http2.ConfigureServer`
-  called) handles h1/h2 negotiation, keep-alive, and upgrades.
-- **Custom `http.RoundTripper`** converts between `net/http` and
-  `bogdanfinn/fhttp` without buffering bodies.
-- **Singleflight + LRU** around leaf-cert signing.
-
-## Security notes
-
-- The generated MITM CA can sign a cert for any hostname. **Do not**
-  install it in your system trust store. Use `--cacert` on curl or the
-  equivalent on whatever client you point at fauxbrowser.
-- `ca.key` is written `0600`; `.gitignore` excludes it.
-- Enable `-auth` when exposing the listener beyond loopback. Use
-  `-allow-hosts` to restrict which upstream hosts may be proxied.
-- The docker-compose stack wires fauxbrowser into gluetun's netns; if
-  gluetun's tunnel drops, gluetun's firewall blocks fauxbrowser egress.
-
-## Development
+## Tests
 
 ```sh
-go test -race ./...      # full suite
-go build ./cmd/fauxbrowser
-nix build .#fauxbrowser  # builds + runs tests via checks.default
+go test -race ./...
 ```
 
-Layout:
+Coverage:
+- `internal/proton`: catalog + pool, country/continent/tier filtering.
+- `internal/rotator`: heuristic matrix + blue/green state machine
+  (happy path, host quarantine, debounce, drain, concurrent burst).
+- `internal/wgtunnel`: wg-quick parsing, `WithPeer` clone.
+- `internal/proxy`: h2c multiplexing, header scrub, bearer auth,
+  profile coherence invariant.
 
-```
-cmd/fauxbrowser/main.go          CLI flags, wiring, graceful shutdown
-internal/config/                 Config struct + env overlay
-internal/ca/                     CA generation, load, LRU leaf cache
-internal/proxy/transport.go      tls-client RoundTripper pool
-internal/proxy/server.go         ReverseProxy + mode handlers
-internal/proxy/mitm.go           CONNECT → in-memory TLS server
-internal/proxy/auth.go           Basic auth + host allow-list
-internal/proxy/profiles.go       browser profile table
-internal/proxy/browser_headers.go UA/Accept defaults per profile
-internal/proxy/selfhost.go       self-host detection
-internal/proxy/*_test.go         unit + e2e httptest coverage
-```
+## Credits
+
+fauxbrowser stands on the shoulders of two excellent upstream
+projects, without which it wouldn't exist:
+
+- **[bogdanfinn/tls-client](https://github.com/bogdanfinn/tls-client)** —
+  the patched uTLS fork that drives every outbound TLS handshake.
+  It ships the Chrome, Firefox, and Safari TLS profiles that make
+  fingerprint forging actually work on modern WAFs.
+- **[qdm12/gluetun](https://github.com/qdm12/gluetun)** — the
+  reference VPN sidecar whose approach to WireGuard-through-gVisor,
+  kill-switch semantics, and provider discovery shaped the rotator
+  design here. Gluetun is still the right choice if you want a
+  general-purpose multi-provider VPN container; fauxbrowser is the
+  right choice if you want one binary that also forges TLS
+  fingerprints and rotates exits on rate-limits.
 
 ## License
 

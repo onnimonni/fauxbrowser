@@ -1,75 +1,54 @@
+// Bearer-token auth middleware.
+//
+// fauxbrowser defaults to binding on 127.0.0.1 with no auth, because
+// the expected deployment is a sidecar next to a single Elixir worker.
+// If the operator binds either the proxy or admin listener to a non-
+// loopback interface, main.go's safetyCheck REFUSES to start without
+// a token set.
+//
+// Token comparison uses subtle.ConstantTimeCompare so failed attempts
+// don't leak timing information. An empty token means "auth disabled"
+// and the middleware is a no-op pass-through — this is the loopback
+// default.
 package proxy
 
 import (
-	"encoding/base64"
+	"crypto/subtle"
 	"net/http"
-	nurl "net/url"
-	"path"
 	"strings"
 )
 
-// BasicAuth wraps h with a Proxy-Authorization: Basic gate.
-// Empty expected value disables the gate.
-func BasicAuth(h http.Handler, expected string) http.Handler {
-	if expected == "" {
+// BearerAuth wraps h with a bearer-token check. If token is empty, the
+// returned handler is h unchanged (auth disabled). Non-empty tokens
+// require every request to present
+// "Authorization: Bearer <token>" — any other value (missing, wrong
+// scheme, wrong value) returns 401.
+func BearerAuth(h http.Handler, token string) http.Handler {
+	if token == "" {
 		return h
 	}
-	token := "Basic " + base64.StdEncoding.EncodeToString([]byte(expected))
+	want := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Proxy-Authorization") != token {
-			w.Header().Set("Proxy-Authenticate", `Basic realm="fauxbrowser"`)
-			http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
-			return
-		}
-		r.Header.Del("Proxy-Authorization")
-		h.ServeHTTP(w, r)
-	})
-}
-
-// HostAllowList wraps h and 403s requests whose effective target host does
-// not match any glob pattern. Globs use filepath-style `*` matching against
-// the host portion only. Empty list = allow any.
-func HostAllowList(h http.Handler, globs []string, targetHeader string) http.Handler {
-	if len(globs) == 0 {
-		return h
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		target := extractTargetHost(r, targetHeader)
-		if target == "" || !matchAny(target, globs) {
-			http.Error(w, "fauxbrowser: host not in allow-list", http.StatusForbidden)
+		got := extractBearer(r.Header.Get("Authorization"))
+		if got == "" || subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="fauxbrowser"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		h.ServeHTTP(w, r)
 	})
 }
 
-func extractTargetHost(r *http.Request, targetHeader string) string {
-	if r.Method == http.MethodConnect {
-		return hostOnly(r.Host)
+// extractBearer returns the token portion of an "Authorization: Bearer <tok>"
+// header value. Case-insensitive on the scheme. Returns "" if the header
+// isn't a bearer grant.
+func extractBearer(header string) string {
+	const prefix = "Bearer "
+	if len(header) <= len(prefix) {
+		return ""
 	}
-	if v := r.Header.Get(targetHeader); v != "" {
-		if u, err := nurl.Parse(v); err == nil {
-			return hostOnly(u.Host)
-		}
+	if !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
 	}
-	if r.URL != nil && r.URL.IsAbs() {
-		return hostOnly(r.URL.Host)
-	}
-	return hostOnly(r.Host)
-}
-
-func hostOnly(hostport string) string {
-	if i := strings.IndexByte(hostport, ':'); i >= 0 {
-		return hostport[:i]
-	}
-	return hostport
-}
-
-func matchAny(host string, globs []string) bool {
-	for _, g := range globs {
-		if ok, err := path.Match(g, host); err == nil && ok {
-			return true
-		}
-	}
-	return false
+	return strings.TrimSpace(header[len(prefix):])
 }
