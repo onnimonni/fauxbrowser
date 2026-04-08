@@ -12,11 +12,11 @@
         pkgs = import nixpkgs { inherit system; };
         fauxbrowser = pkgs.buildGoModule {
           pname = "fauxbrowser";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
-          vendorHash = "sha256-tGoMEw8zb3QRjTkXKbFBbFJOQPNHcxpcHEs5DTAiOa4=";
-          subPackages = [ "." ];
-          doCheck = false;
+          vendorHash = "sha256-ZW+lIIPlikx+CQyCfO53UgKksgwTGHgIdPfzlH/Y1ok=";
+          subPackages = [ "cmd/fauxbrowser" ];
+          doCheck = true;
           meta = with pkgs.lib; {
             description = "TLS fingerprint forging HTTP proxy (uses bogdanfinn/tls-client)";
             license = licenses.mit;
@@ -32,6 +32,8 @@
           type = "app";
           program = "${fauxbrowser}/bin/fauxbrowser";
         };
+
+        checks.default = fauxbrowser;
 
         devShells.default = pkgs.mkShell {
           packages = [ pkgs.go pkgs.gopls pkgs.curl ];
