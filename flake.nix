@@ -13,7 +13,7 @@
         pname = "fauxbrowser";
         version = "0.8.0";
         src = ./.;
-        vendorHash = "sha256-IJQBeCjtTnTiipDq/ScexOnmZcmli94OvairWF7olFo=";
+        vendorHash = "sha256-OHRRP6yNsxLTs37cZvBwZBzpnfgwLNK6sstNVstj0Qw=";
         subPackages = [ "cmd/fauxbrowser" ];
         ldflags = [
           "-s"

@@ -43,6 +43,23 @@ jobs:
       - name: go build
         run: go build ./...
 
+  nix-build:
+    # Verifies flake.nix vendorHash is correct. Catches the "go.sum
+    # changed but vendorHash wasn't updated" class of bug that breaks
+    # all nix consumers.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: nix build
+        run: nix build .#packages.x86_64-linux.default
+
   tls-fingerprint:
     # Cross-check that nixpkgs chromium and bogdanfinn/tls-client's
     # Chrome_NNN profile emit the same JA4 on the wire. Catches
