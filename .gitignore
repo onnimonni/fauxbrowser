@@ -9,9 +9,10 @@ devenv.local.yaml
 # pre-commit
 .pre-commit-config.yaml
 
-# build artifacts
-fauxbrowser
-tls-fp-proxy
+# build artifacts (binary at repo root only — NOT cmd/fauxbrowser/)
+/fauxbrowser
+/tls-fp-proxy
+/result
 *.log
 *.pid
 
