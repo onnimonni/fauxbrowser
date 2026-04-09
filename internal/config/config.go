@@ -32,6 +32,8 @@ type Config struct {
 	SolverURL    string        // e.g. http://127.0.0.1:8191
 	SolverEgress string        // proxy URL the solver should use as ITS egress
 	SolverTTL    time.Duration // cache lifetime for solved cookies
+
+	WGConf string // path to a wg-quick style .conf file; enables embedded tunnel
 }
 
 func Default() *Config {
@@ -89,6 +91,9 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("FAUXBROWSER_LOG_LEVEL"); v != "" {
 		c.LogLevel = v
+	}
+	if v := os.Getenv("FAUXBROWSER_WG_CONF"); v != "" {
+		c.WGConf = v
 	}
 	if v := os.Getenv("FAUXBROWSER_SOLVER"); v != "" {
 		c.Solver = v

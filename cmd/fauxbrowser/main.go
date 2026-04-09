@@ -20,6 +20,7 @@ import (
 	"github.com/onnimonni/fauxbrowser/internal/proxy"
 	"github.com/onnimonni/fauxbrowser/internal/solver"
 	"github.com/onnimonni/fauxbrowser/internal/solver/flaresolverr"
+	"github.com/onnimonni/fauxbrowser/internal/wgtunnel"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=<sha>".
@@ -54,6 +55,7 @@ func run() error {
 	fs.IntVar(&cfg.SessionMax, "session-max", cfg.SessionMax, "max concurrent tls-client sessions in pool")
 	fs.BoolVar(&cfg.Insecure, "insecure", cfg.Insecure, "skip upstream TLS verification (tests only)")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "debug|info|warn|error")
+	fs.StringVar(&cfg.WGConf, "wg-conf", cfg.WGConf, "path to a WireGuard .conf file. When set, fauxbrowser embeds a userspace WireGuard tunnel and egresses via it (no external gluetun needed). Overrides -upstream.")
 	fs.StringVar(&cfg.Solver, "solver", cfg.Solver, "challenge solver: flaresolverr (empty = disabled)")
 	fs.StringVar(&cfg.SolverURL, "solver-url", cfg.SolverURL, "URL of the challenge solver backend (e.g. http://127.0.0.1:8191)")
 	fs.StringVar(&cfg.SolverEgress, "solver-egress", cfg.SolverEgress, "HTTP proxy URL the solver should egress through (defaults to -upstream). Must be reachable from the solver container.")
@@ -84,6 +86,31 @@ func run() error {
 	}
 	leafCache := ca.NewLeafCache(pair, cfg.LeafCacheMax)
 
+	// Optional embedded WireGuard tunnel (userspace, no NET_ADMIN needed).
+	var wgTun *wgtunnel.Tunnel
+	if cfg.WGConf != "" {
+		wcfg, err := wgtunnel.LoadConfig(cfg.WGConf)
+		if err != nil {
+			return fmt.Errorf("load wg conf: %w", err)
+		}
+		slog.Info("bringing up embedded WireGuard tunnel",
+			"conf", cfg.WGConf,
+			"endpoint", fmt.Sprintf("%s:%d", wcfg.EndpointHost, wcfg.EndpointPort),
+			"addresses", wcfg.Addresses,
+		)
+		wgTun, err = wgtunnel.Start(wcfg, func(f string, a ...any) {
+			slog.Debug(fmt.Sprintf(f, a...))
+		})
+		if err != nil {
+			return fmt.Errorf("start wg tunnel: %w", err)
+		}
+		defer wgTun.Close()
+		if cfg.Upstream != "" {
+			slog.Warn("ignoring -upstream because -wg-conf is set", "upstream", cfg.Upstream)
+			cfg.Upstream = ""
+		}
+	}
+
 	// Optional WAF challenge solver.
 	var solverCache *solver.Cache
 	switch strings.ToLower(cfg.Solver) {
@@ -101,7 +128,7 @@ func run() error {
 	}
 
 	// Transport (tls-client pool).
-	transport := proxy.NewTransport(proxy.TransportOptions{
+	transportOpts := proxy.TransportOptions{
 		DefaultProfile: cfg.Profile,
 		UpstreamProxy:  cfg.Upstream,
 		TimeoutSeconds: cfg.TimeoutSecs,
@@ -111,7 +138,11 @@ func run() error {
 		MaxSessions:    cfg.SessionMax,
 		SolverCache:    solverCache,
 		SolverEgress:   cfg.SolverEgress,
-	})
+	}
+	if wgTun != nil {
+		transportOpts.CustomDialer = wgTun.ContextDialer()
+	}
+	transport := proxy.NewTransport(transportOpts)
 	defer transport.Close()
 
 	mitm := proxy.NewMITM(leafCache, transport)

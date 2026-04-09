@@ -12,9 +12,9 @@
         pkgs = import nixpkgs { inherit system; };
         fauxbrowser = pkgs.buildGoModule {
           pname = "fauxbrowser";
-          version = "0.2.0";
+          version = "0.4.0";
           src = ./.;
-          vendorHash = "sha256-ZW+lIIPlikx+CQyCfO53UgKksgwTGHgIdPfzlH/Y1ok=";
+          vendorHash = "sha256-n02zSPn/NJADb92FBhFALuoY5xLlW8O9LBKYisFg9Z0=";
           subPackages = [ "cmd/fauxbrowser" ];
           doCheck = true;
           meta = with pkgs.lib; {
