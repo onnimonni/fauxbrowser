@@ -180,6 +180,110 @@ func TestCacheSolveErrorNotCached(t *testing.T) {
 	}
 }
 
+// --- disk persistence ---
+
+func TestCacheSaveAndLoad(t *testing.T) {
+	stub := &stubSolver{
+		cookies: []*http.Cookie{
+			{Name: "cf_clearance", Value: "abc123"},
+			{Name: "__cf_bm", Value: "bm456"},
+		},
+	}
+	c := NewCache(stub, 1*time.Hour)
+	target, _ := url.Parse("https://example.com/")
+
+	// Solve and cache an entry.
+	_, err := c.LookupOrSolve(context.Background(), target, "1.2.3.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Size() != 1 {
+		t.Fatalf("expected 1 entry, got %d", c.Size())
+	}
+
+	// Save to temp file.
+	tmpFile := t.TempDir() + "/cookies.json"
+	if err := c.SaveToFile(tmpFile); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Load into a fresh cache.
+	c2 := NewCache(stub, 1*time.Hour)
+	loaded, err := c2.LoadFromFile(tmpFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded != 1 {
+		t.Errorf("loaded %d entries, want 1", loaded)
+	}
+
+	// Verify the loaded entry is usable.
+	sol := c2.Lookup("example.com", "1.2.3.4")
+	if sol == nil {
+		t.Fatal("loaded entry not found via Lookup")
+	}
+	if sol.Cookie("cf_clearance") != "abc123" {
+		t.Errorf("cf_clearance = %q, want abc123", sol.Cookie("cf_clearance"))
+	}
+}
+
+func TestCacheLoadSkipsExpired(t *testing.T) {
+	stub := &stubSolver{
+		cookies: []*http.Cookie{{Name: "cf_clearance", Value: "old"}},
+	}
+	c := NewCache(stub, 1*time.Millisecond)
+
+	now := time.Unix(1_000_000, 0)
+	c.nowFn = func() time.Time { return now }
+
+	target, _ := url.Parse("https://example.com/")
+	_, _ = c.LookupOrSolve(context.Background(), target, "1.2.3.4")
+
+	tmpFile := t.TempDir() + "/cookies.json"
+	_ = c.SaveToFile(tmpFile)
+
+	// Advance clock past expiry.
+	c2 := NewCache(stub, 1*time.Millisecond)
+	c2.nowFn = func() time.Time { return now.Add(1 * time.Hour) }
+	loaded, _ := c2.LoadFromFile(tmpFile)
+	if loaded != 0 {
+		t.Errorf("expired entries should not be loaded, got %d", loaded)
+	}
+}
+
+func TestCookiesPreservedAcrossRotation(t *testing.T) {
+	// Simulate: solve on IP A, rotate to IP B, check IP A's cookies
+	// are still in the cache.
+	stub := &stubSolver{
+		cookies: []*http.Cookie{{Name: "cf_clearance", Value: "preserved"}},
+	}
+	c := NewCache(stub, 1*time.Hour)
+	target, _ := url.Parse("https://example.com/")
+
+	_, _ = c.LookupOrSolve(context.Background(), target, "1.2.3.4")
+	if c.Size() != 1 {
+		t.Fatal("expected 1 cached entry")
+	}
+
+	// Simulate rotation: DO NOT call InvalidateExit (new behavior).
+	// Old code would call c.InvalidateExit("1.2.3.4") here.
+	// Now we just snapshot the new IP and move on.
+
+	// Verify cookies are still accessible for the old IP.
+	sol := c.Lookup("example.com", "1.2.3.4")
+	if sol == nil {
+		t.Fatal("cookies should survive rotation")
+	}
+	if sol.Cookie("cf_clearance") != "preserved" {
+		t.Errorf("cf_clearance = %q, want preserved", sol.Cookie("cf_clearance"))
+	}
+
+	// A lookup for the NEW IP should miss (no cookies solved yet).
+	if c.Lookup("example.com", "5.6.7.8") != nil {
+		t.Error("new IP should not have cached cookies")
+	}
+}
+
 // --- circuit breaker ---
 
 func TestCircuitBreakerClosedInitially(t *testing.T) {

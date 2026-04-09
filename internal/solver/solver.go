@@ -65,6 +65,11 @@ type Solution struct {
 
 	// SolvedAt is the wall-clock time of the successful solve.
 	SolvedAt time.Time
+
+	// hostHint is the hostname this solution was solved for. Used
+	// by the disk persistence layer to reconstruct cache keys on
+	// load. Not exported — set internally by Cache.store().
+	hostHint string
 }
 
 // Cookie returns the value of a named cookie from the solution, or

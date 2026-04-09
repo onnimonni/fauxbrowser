@@ -54,6 +54,7 @@ func run() error {
 	fs.DurationVar(&cfg.SolverTTL, "solver-ttl", cfg.SolverTTL, "how long to cache a solved (host, exit_ip) cookie bundle")
 	fs.DurationVar(&cfg.SolverTimeout, "solver-timeout", cfg.SolverTimeout, "max time per Chromium solve (startup + navigation + extract)")
 	fs.StringVar(&cfg.ChromiumPath, "chromium-path", cfg.ChromiumPath, "absolute Chromium binary path (default = $PATH lookup)")
+	fs.StringVar(&cfg.CookieStorePath, "cookie-store", cfg.CookieStorePath, "file path for persisting CF cookie cache across restarts (empty = in-memory only)")
 	fs.BoolVar(&cfg.AllowVersionMismatch, "allow-version-mismatch", cfg.AllowVersionMismatch,
 		"start even if chromedp solver's Chromium has a Chrome major version that has no matching tls-client profile "+
 			"(or disagrees with an explicit -profile). Use when nixpkgs chromium just got bumped to N+1 and bogdanfinn/tls-client "+
@@ -193,12 +194,23 @@ func run() error {
 			Logf:          func(msg string, args ...any) { slog.Info(msg, args...) },
 		})
 		solverCache = solver.NewCache(ch, cfg.SolverTTL)
+		// Restore persisted cookies from a previous run.
+		if cfg.CookieStorePath != "" {
+			if n, err := solverCache.LoadFromFile(cfg.CookieStorePath); err != nil {
+				if !os.IsNotExist(err) {
+					slog.Warn("solver: could not load cookie store", "path", cfg.CookieStorePath, "err", err)
+				}
+			} else if n > 0 {
+				slog.Info("solver: restored cookies from disk", "path", cfg.CookieStorePath, "loaded", n)
+			}
+		}
 		slog.Info("WAF challenge solver enabled",
 			"solver", "chromedp",
 			"profile", profile.Name,
 			"chromium_major", chromiumMajor,
 			"ttl", cfg.SolverTTL.String(),
-			"timeout", cfg.SolverTimeout.String())
+			"timeout", cfg.SolverTimeout.String(),
+			"cookie_store", cfg.CookieStorePath)
 	}
 
 	var transport *proxy.Transport
@@ -219,31 +231,33 @@ func run() error {
 		MaxRetireAge:      cfg.MaxRetireAge,
 		ReaperInterval:    cfg.ReaperInterval,
 		OnRotate: func() {
-			// After the swap, clear our internal cookie jar so no
-			// Set-Cookie from the old IP can leak into a request sent
-			// via the new IP. Caller-set Cookie headers on incoming
-			// requests are untouched.
+			// After the swap, clear our internal tls-client cookie
+			// jar (Set-Cookie from upstream) so stale non-CF session
+			// cookies don't leak to the new IP. Caller-set Cookie
+			// headers on incoming requests are untouched.
 			if transport != nil {
 				if err := transport.RotateJar(); err != nil {
 					slog.Warn("rotator: jar rebuild failed", "err", err)
 				}
 			}
-			// Solver cache cookies are bound to the (UA, exit_ip)
-			// tuple — must drop everything for the OLD exit IP on
-			// rotation.
-			if solverCache != nil {
-				oldIP := *prevExitIP.Load()
-				if oldIP != "" {
-					dropped := solverCache.InvalidateExit(oldIP)
-					if dropped > 0 {
-						slog.Info("solver: cache invalidated for old exit IP",
-							"old_ip", oldIP, "dropped", dropped)
-					}
-				}
-			}
+			// Solver cache cookies (cf_clearance, _abck, etc.) are
+			// PRESERVED across rotations. They're keyed by (host,
+			// exitIP) — if the pool cycles back to the same IP
+			// later, the cached cookies are ready. Cookies are only
+			// invalidated when a CF-specific 403 rejects them
+			// (handled by transport's MarkRetryFailed + Invalidate).
+			//
 			// Snapshot the new exit IP for the next rotation event.
 			newIP := rot.Stats().CurrentIP
 			prevExitIP.Store(&newIP)
+
+			// Persist solver cache to disk if a store path is
+			// configured.
+			if solverCache != nil && cfg.CookieStorePath != "" {
+				if err := solverCache.SaveToFile(cfg.CookieStorePath); err != nil {
+					slog.Warn("solver: disk save failed", "err", err)
+				}
+			}
 		},
 		Logf: func(msg string, args ...any) { slog.Info(msg, args...) },
 	})
@@ -324,6 +338,14 @@ func run() error {
 	_ = srv.Shutdown(shutdownCtx)
 	if adminSrv != nil {
 		_ = adminSrv.Shutdown(shutdownCtx)
+	}
+	// Persist solver cookies on clean shutdown.
+	if solverCache != nil && cfg.CookieStorePath != "" {
+		if err := solverCache.SaveToFile(cfg.CookieStorePath); err != nil {
+			slog.Warn("solver: cookie store save on shutdown failed", "err", err)
+		} else {
+			slog.Info("solver: cookie store saved", "path", cfg.CookieStorePath, "entries", solverCache.Size())
+		}
 	}
 	return nil
 }

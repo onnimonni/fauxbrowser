@@ -2,7 +2,12 @@ package solver
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -10,10 +15,11 @@ import (
 )
 
 // Cache wraps a Solver with a TTL-bound cache keyed on
-// (host, exit_ip). When the rotator swaps to a new exit IP, the
-// transport calls InvalidateExit(ip) to drop every entry bound to
-// that IP — clearance cookies are exit-IP-bound and meaningless
-// after rotation.
+// (host, exit_ip). CF clearance cookies are preserved across VPN
+// IP rotations — they're only invalidated when Cloudflare
+// explicitly rejects them (CF-specific 403). On a 429 rotation
+// the cookies stay cached so they're ready if we cycle back to
+// the same exit IP later.
 //
 // Concurrent solves for the same key are deduplicated via
 // golang.org/x/sync/singleflight: 100 simultaneous requests to a
@@ -147,6 +153,7 @@ func (c *Cache) LookupOrSolve(ctx context.Context, target *url.URL, exitIP strin
 }
 
 func (c *Cache) store(host, exitIP string, sol *Solution) {
+	sol.hostHint = host // for disk persistence reconstruction
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	expiry := time.Time{}
@@ -291,4 +298,98 @@ type CircuitStatusEntry struct {
 	ConsecutiveFailures int
 	Open                bool
 	OpenFor             time.Duration
+}
+
+// --- disk persistence ---
+
+// persistEntry is the JSON-serializable form of a cacheEntry.
+type persistEntry struct {
+	Host     string         `json:"host"`
+	ExitIP   string         `json:"exit_ip"`
+	Cookies  []*http.Cookie `json:"cookies"`
+	UA       string         `json:"user_agent"`
+	SolvedAt time.Time      `json:"solved_at"`
+	Expiry   time.Time      `json:"expiry"`
+}
+
+// SaveToFile serializes the current cache entries to a JSON file.
+// Only entries with unexpired cookies are written. Circuit-breaker
+// state is NOT persisted (it's ephemeral and resets on restart).
+//
+// The file is written atomically: write to a temp file in the same
+// directory, then rename. Safe for concurrent reads by external
+// tools.
+func (c *Cache) SaveToFile(path string) error {
+	c.mu.RLock()
+	now := c.nowFn()
+	var entries []persistEntry
+	for _, e := range c.entries {
+		if c.ttl > 0 && now.After(e.expiry) {
+			continue // skip expired
+		}
+		entries = append(entries, persistEntry{
+			Host:     e.solution.hostHint,
+			ExitIP:   e.exitIP,
+			Cookies:  e.solution.Cookies,
+			UA:       e.solution.UserAgent,
+			SolvedAt: e.solution.SolvedAt,
+			Expiry:   e.expiry,
+		})
+	}
+	c.mu.RUnlock()
+
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// LoadFromFile restores cache entries from a JSON file previously
+// written by SaveToFile. Expired entries are skipped. Entries that
+// conflict with existing in-memory entries are skipped (in-memory
+// wins). Returns the number of entries loaded.
+func (c *Cache) LoadFromFile(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	var entries []persistEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return 0, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.nowFn()
+	loaded := 0
+	for _, pe := range entries {
+		if c.ttl > 0 && now.After(pe.Expiry) {
+			continue
+		}
+		key := cacheKey(pe.Host, pe.ExitIP)
+		if _, exists := c.entries[key]; exists {
+			continue // in-memory wins
+		}
+		c.entries[key] = &cacheEntry{
+			solution: &Solution{
+				Cookies:   pe.Cookies,
+				UserAgent: pe.UA,
+				SolvedAt:  pe.SolvedAt,
+				hostHint:  pe.Host,
+			},
+			expiry: pe.Expiry,
+			exitIP: pe.ExitIP,
+		}
+		loaded++
+	}
+	slog.Info("solver: loaded cookie cache from disk",
+		"path", path, "loaded", loaded, "skipped_expired", len(entries)-loaded)
+	return loaded, nil
 }
