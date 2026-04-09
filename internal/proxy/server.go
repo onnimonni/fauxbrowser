@@ -138,7 +138,7 @@ func safeURL(r *http.Request) string {
 //   - Because the bytes inside the tunnel are encrypted, fauxbrowser
 //     cannot see HTTP status codes, headers, or cookies. The rotator's
 //     429/403/503 heuristic does NOT fire on CONNECT traffic. You can
-//     still rotate manually via POST /rotate on the admin listener.
+//     still rotate manually via POST /.internal/rotate on the admin listener.
 //   - The header scrub (X-Forwarded-For, Via, etc.) does NOT apply to
 //     CONNECT traffic — those headers live inside the encrypted
 //     stream and fauxbrowser never sees them. Make sure your client
