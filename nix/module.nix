@@ -76,8 +76,9 @@ in
       default = null;
       example = "127.0.0.1:18444";
       description = ''
-        Optional admin listener serving /healthz and POST /rotate.
-        Non-loopback addresses REQUIRE `adminTokenFile` to be set.
+        Optional admin listener serving GET /.internal/healthz,
+        GET /.internal/solver, and POST /.internal/rotate. Non-loopback
+        addresses REQUIRE `adminTokenFile` to be set.
       '';
     };
 

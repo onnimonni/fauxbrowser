@@ -187,14 +187,14 @@ func (c *Cache) InvalidateExit(exitIP string) int {
 }
 
 // Size returns the number of cached entries (mostly for tests
-// and /healthz).
+// and /.internal/healthz).
 func (c *Cache) Size() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.entries)
 }
 
-// Solver returns the underlying solver, mostly for /healthz to
+// Solver returns the underlying solver, mostly for /.internal/healthz to
 // expose its name.
 func (c *Cache) Solver() Solver { return c.solver }
 
@@ -264,7 +264,7 @@ func (c *Cache) MarkRetrySucceeded(host string) {
 }
 
 // CircuitStatus returns a read-only snapshot of the per-host
-// circuit state for /healthz or debugging. Keys are host names.
+// circuit state for /.internal/healthz or debugging. Keys are host names.
 func (c *Cache) CircuitStatus() map[string]CircuitStatusEntry {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

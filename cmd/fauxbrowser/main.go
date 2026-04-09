@@ -45,7 +45,7 @@ func run() error {
 
 	fs := flag.NewFlagSet("fauxbrowser", flag.ExitOnError)
 	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "plaintext h2c listen address")
-	fs.StringVar(&cfg.AdminListen, "admin-listen", cfg.AdminListen, "optional admin listener (/healthz, /rotate)")
+	fs.StringVar(&cfg.AdminListen, "admin-listen", cfg.AdminListen, "optional admin listener (GET /.internal/healthz, GET /.internal/solver, POST /.internal/rotate)")
 	fs.StringVar(&cfg.WGConf, "wg-conf", cfg.WGConf, "path to a wg-quick .conf (only PrivateKey + Address/DNS are used; peer is picked from the Proton catalog)")
 	fs.StringVar(&cfg.WGPrivateKey, "wg-private-key", cfg.WGPrivateKey, "base64 WireGuard private key (alternative to -wg-conf; gluetun-style)")
 	fs.StringVar(&cfg.VPNTier, "vpn-tier", cfg.VPNTier, "server tier: free (default), paid|plus, or all")
@@ -328,18 +328,26 @@ func run() error {
 	return nil
 }
 
+// Admin endpoint path prefix. Leading-dot segments are illegal in
+// DNS hostnames and URL authority components, so no real upstream
+// target will ever have a path starting with /.internal/. This
+// gives admin endpoints a collision-free namespace even if an
+// operator mounts the admin mux on the same listener as the proxy
+// (not the default, but possible).
+const adminPrefix = "/.internal/"
+
 func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Cache) *http.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(adminPrefix+"healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(rot.Stats())
 	})
-	// /solver exposes the per-host solver circuit-breaker state.
-	// Open circuits indicate hosts where repeated solve-then-retry
-	// still got challenged — likely WAF cookie pinning. Useful for
-	// debugging "why is my request failing" without reading server
-	// logs.
-	mux.HandleFunc("/solver", func(w http.ResponseWriter, _ *http.Request) {
+	// /.internal/solver exposes the per-host solver circuit-breaker
+	// state. Open circuits indicate hosts where repeated
+	// solve-then-retry still got challenged — likely WAF cookie
+	// pinning. Useful for debugging "why is my request failing"
+	// without reading server logs.
+	mux.HandleFunc(adminPrefix+"solver", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if solverCache == nil {
 			_ = json.NewEncoder(w).Encode(map[string]any{"enabled": false})
@@ -351,7 +359,7 @@ func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Ca
 			"circuits":     solverCache.CircuitStatus(),
 		})
 	})
-	mux.HandleFunc("/rotate", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(adminPrefix+"rotate", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", http.StatusMethodNotAllowed)
 			return

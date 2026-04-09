@@ -92,3 +92,26 @@ func TestSafetyCheckNonLoopbackAdminWithTokenOK(t *testing.T) {
 		t.Errorf("non-loopback admin with token should be OK, got %v", err)
 	}
 }
+
+// TestAdminPrefixCollisionSafe documents the invariant that admin
+// endpoints live under a path segment that is illegal in DNS
+// hostnames (leading dot), so no real upstream target can ever
+// have a path starting with adminPrefix. This matters if an
+// operator ever mounts the admin mux on the same listener as the
+// proxy (not the default, but possible) — standard bare names
+// like "/healthz" would clash with any target that happened to
+// serve a /healthz endpoint, but /.internal/* cannot.
+func TestAdminPrefixCollisionSafe(t *testing.T) {
+	if !strings.HasPrefix(adminPrefix, "/.") {
+		t.Errorf("adminPrefix must start with /. to stay collision-free with real HTTP targets; got %q", adminPrefix)
+	}
+	if !strings.HasSuffix(adminPrefix, "/") {
+		t.Errorf("adminPrefix must end with / for http.ServeMux subtree matching; got %q", adminPrefix)
+	}
+	// Guard against typos like /.internal (no trailing slash) or
+	// /internal (no leading dot).
+	want := "/.internal/"
+	if adminPrefix != want {
+		t.Errorf("adminPrefix = %q, want %q (update docs if this changes)", adminPrefix, want)
+	}
+}

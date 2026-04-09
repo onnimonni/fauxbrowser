@@ -31,7 +31,7 @@ go build -o fauxbrowser ./cmd/fauxbrowser
 # lock to a continent
 ./fauxbrowser -wg-conf /path/to/proton.conf -vpn-continent EU
 
-# with admin listener for /healthz and POST /rotate
+# with admin listener — GET /.internal/healthz, /.internal/solver, POST /.internal/rotate
 ./fauxbrowser -wg-conf /path/to/proton.conf \
   -listen 127.0.0.1:18443 \
   -admin-listen 127.0.0.1:18444
@@ -101,7 +101,7 @@ CONNECT is the right mode for routing an HTTP_PROXY-aware client
 - **Rotation visibility is bypassed.** fauxbrowser cannot see HTTP
   status codes inside the encrypted stream, so the 429/403/503
   heuristic does NOT fire on CONNECT traffic. You can still rotate
-  manually via `POST /rotate`.
+  manually via `POST /.internal/rotate`.
 - **Header scrub is bypassed.** `X-Forwarded-For`, `Via`, etc. that
   the client sets are inside the encrypted stream — fauxbrowser
   never sees them. Make sure your client doesn't set them.
@@ -165,7 +165,7 @@ empty `CapabilityBoundingSet`, `MemoryDenyWriteExecute=true`,
 
 ```
 -listen                h2c+h1 listen address                       (default 127.0.0.1:18443)
--admin-listen          optional /healthz + /rotate listener        (empty = disabled)
+-admin-listen          optional /.internal/{healthz,solver,rotate} (empty = disabled)
 -wg-conf               path to a wg-quick .conf (REQUIRED)
 -vpn-tier              free (default) | paid | all
 -vpn-country           comma-separated ISO-2 country allow-list
