@@ -374,7 +374,7 @@ func entryDir(storeDir, host string) string {
 // entryPath returns the full path for a (host, exitIP) entry file.
 // Layout: {storeDir}/{host}/{exitIP}.json
 //
-//	cookies/www.shop.example.com/185.132.178.104.json
+//	cookies/shop.example.com/185.132.178.104.json
 func entryPath(storeDir, host, exitIP string) string {
 	return filepath.Join(storeDir, host, exitIP+".json")
 }

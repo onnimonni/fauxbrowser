@@ -101,7 +101,7 @@ Both `test` and `tls-fingerprint` jobs must pass.
 4. **HTTP headers** — forced: UA + sec-ch-ua bundle. Soft defaults:
    Accept, Accept-Language, Accept-Encoding, Sec-Fetch-*, Priority.
 
-## Testing shop.example.com (or similar CF Enterprise targets)
+## Testing against CF Enterprise targets
 
 ```bash
 # Start locally with WG conf
@@ -109,7 +109,7 @@ Both `test` and `tls-fingerprint` jobs must pass.
   -solver chromedp -chromium-path "$(which chromium)"
 
 # Test via fast path
-curl -H "X-Target-URL: https://www.shop.example.com/" \
+curl -H "X-Target-URL: https://target-site.example/" \
      -H "Accept-Language: fi-FI,fi;q=0.9,en;q=0.8" \
      http://127.0.0.1:18443/
 ```
@@ -119,3 +119,4 @@ Expected: HTTP 200 on fast path without solver invocation (as of
 - VPN exit IP reputation (try `curl -H "X-Target-URL: https://example.com/" ...` first)
 - Header order drift (compare `tls.peet.ws` output)
 - TLS JA4 drift (run `tls_fingerprint_ci` tests)
+- Per-host diagnostics at `GET /.internal/stats/{host}`

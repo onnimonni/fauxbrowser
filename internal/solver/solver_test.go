@@ -233,7 +233,7 @@ func TestCacheDirLayout(t *testing.T) {
 		cookies: []*http.Cookie{{Name: "cf_clearance", Value: "v1"}},
 	}
 	c := NewCache(stub, 1*time.Hour)
-	target1, _ := url.Parse("https://www.shop.example.com/")
+	target1, _ := url.Parse("https://shop.example.com/")
 	target2, _ := url.Parse("https://example.com/")
 
 	_, _ = c.LookupOrSolve(context.Background(), target1, "1.2.3.4")
@@ -245,10 +245,10 @@ func TestCacheDirLayout(t *testing.T) {
 	}
 
 	// Verify hostname-partitioned directory layout:
-	//   {dir}/www.shop.example.com/1.2.3.4.json
+	//   {dir}/shop.example.com/1.2.3.4.json
 	//   {dir}/example.com/5.6.7.8.json
 	for _, want := range []string{
-		"www.shop.example.com/1.2.3.4.json",
+		"shop.example.com/1.2.3.4.json",
 		"example.com/5.6.7.8.json",
 	} {
 		full := dir + "/" + want

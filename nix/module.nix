@@ -188,7 +188,7 @@ in
         Directory for persisting the solver's CF cookie cache to disk.
         Hostname-partitioned layout:
 
-            /var/lib/fauxbrowser/cookies/www.shop.example.com/185.132.178.104.json
+            /var/lib/fauxbrowser/cookies/shop.example.com/185.132.178.104.json
 
         One file per (host, exitIP) — O(1) per-entry writes, crash-safe,
         inspectable via `ls` / `cat`. Expired files are cleaned on startup.

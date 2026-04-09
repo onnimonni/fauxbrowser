@@ -330,7 +330,7 @@ When a rotation is triggered:
   (WAF rejection) or TTL expiry.
 - **`-cookie-store <dir>`**: persists solver cookies to disk as one
   JSON file per (host, exitIP). Layout:
-  `cookies/www.shop.example.com/185.132.178.104.json`. Loaded on startup,
+  `cookies/shop.example.com/185.132.178.104.json`. Loaded on startup,
   auto-saved on every solve + rotation + shutdown. Solved CF sessions
   survive process restarts.
 - **tls-client jar** (upstream `Set-Cookie` responses) is cleared on
