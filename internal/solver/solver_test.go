@@ -329,7 +329,7 @@ func TestCookiesPreservedAcrossRotation(t *testing.T) {
 
 func TestCircuitBreakerClosedInitially(t *testing.T) {
 	c := NewCache(&stubSolver{}, 5*time.Minute)
-	if c.CircuitOpen("example.com") {
+	if c.CircuitOpen("example.com", "1.2.3.4") {
 		t.Error("fresh cache should have closed circuit for all hosts")
 	}
 }
@@ -339,23 +339,23 @@ func TestCircuitBreakerOpensAfterThreshold(t *testing.T) {
 	c.SetCircuitBreakerTuning(3, 10*time.Minute)
 
 	// First two failures don't open.
-	if opened := c.MarkRetryFailed("bad.host"); opened {
+	if opened := c.MarkRetryFailed("bad.host", "1.2.3.4"); opened {
 		t.Error("failure 1 should not open circuit")
 	}
-	if c.CircuitOpen("bad.host") {
+	if c.CircuitOpen("bad.host", "1.2.3.4") {
 		t.Error("circuit should still be closed after 1 failure")
 	}
-	if opened := c.MarkRetryFailed("bad.host"); opened {
+	if opened := c.MarkRetryFailed("bad.host", "1.2.3.4"); opened {
 		t.Error("failure 2 should not open circuit")
 	}
-	if c.CircuitOpen("bad.host") {
+	if c.CircuitOpen("bad.host", "1.2.3.4") {
 		t.Error("circuit should still be closed after 2 failures")
 	}
 	// Third failure opens.
-	if opened := c.MarkRetryFailed("bad.host"); !opened {
+	if opened := c.MarkRetryFailed("bad.host", "1.2.3.4"); !opened {
 		t.Error("failure 3 should open circuit")
 	}
-	if !c.CircuitOpen("bad.host") {
+	if !c.CircuitOpen("bad.host", "1.2.3.4") {
 		t.Error("circuit should be open after 3 failures")
 	}
 }
@@ -364,13 +364,29 @@ func TestCircuitBreakerIsolatesHosts(t *testing.T) {
 	c := NewCache(&stubSolver{}, 5*time.Minute)
 	c.SetCircuitBreakerTuning(2, 10*time.Minute)
 
-	c.MarkRetryFailed("bad.host")
-	c.MarkRetryFailed("bad.host")
-	if !c.CircuitOpen("bad.host") {
+	c.MarkRetryFailed("bad.host", "1.2.3.4")
+	c.MarkRetryFailed("bad.host", "1.2.3.4")
+	if !c.CircuitOpen("bad.host", "1.2.3.4") {
 		t.Error("bad.host should be open")
 	}
-	if c.CircuitOpen("good.host") {
+	if c.CircuitOpen("good.host", "1.2.3.4") {
 		t.Error("good.host should not be affected by bad.host's circuit")
+	}
+}
+
+func TestCircuitBreakerIsolatesExitIPs(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(2, 10*time.Minute)
+
+	// Host fails on IP A but hasn't been tried on IP B.
+	c.MarkRetryFailed("mixed.host", "1.1.1.1")
+	c.MarkRetryFailed("mixed.host", "1.1.1.1")
+	if !c.CircuitOpen("mixed.host", "1.1.1.1") {
+		t.Error("mixed.host on 1.1.1.1 should be open")
+	}
+	// Same host on a different IP should NOT be circuit-opened.
+	if c.CircuitOpen("mixed.host", "2.2.2.2") {
+		t.Error("mixed.host on 2.2.2.2 should NOT be blocked — different exit IP")
 	}
 }
 
@@ -378,17 +394,17 @@ func TestCircuitBreakerSuccessResets(t *testing.T) {
 	c := NewCache(&stubSolver{}, 5*time.Minute)
 	c.SetCircuitBreakerTuning(3, 10*time.Minute)
 
-	c.MarkRetryFailed("flaky.host")
-	c.MarkRetryFailed("flaky.host")
+	c.MarkRetryFailed("flaky.host", "1.2.3.4")
+	c.MarkRetryFailed("flaky.host", "1.2.3.4")
 	// One away from opening.
-	c.MarkRetrySucceeded("flaky.host")
+	c.MarkRetrySucceeded("flaky.host", "1.2.3.4")
 	// Now three more failures should be needed to open again.
-	c.MarkRetryFailed("flaky.host")
-	c.MarkRetryFailed("flaky.host")
-	if c.CircuitOpen("flaky.host") {
+	c.MarkRetryFailed("flaky.host", "1.2.3.4")
+	c.MarkRetryFailed("flaky.host", "1.2.3.4")
+	if c.CircuitOpen("flaky.host", "1.2.3.4") {
 		t.Error("circuit should NOT be open after success reset + 2 new failures")
 	}
-	if opened := c.MarkRetryFailed("flaky.host"); !opened {
+	if opened := c.MarkRetryFailed("flaky.host", "1.2.3.4"); !opened {
 		t.Error("third new failure after reset should open circuit")
 	}
 }
@@ -401,22 +417,22 @@ func TestCircuitBreakerAutoCloses(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	c.nowFn = func() time.Time { return now }
 
-	c.MarkRetryFailed("pinned.host")
-	c.MarkRetryFailed("pinned.host")
-	if !c.CircuitOpen("pinned.host") {
+	c.MarkRetryFailed("pinned.host", "1.2.3.4")
+	c.MarkRetryFailed("pinned.host", "1.2.3.4")
+	if !c.CircuitOpen("pinned.host", "1.2.3.4") {
 		t.Fatal("expected circuit open")
 	}
 
 	// Advance clock past open duration.
 	now = now.Add(11 * time.Minute)
-	if c.CircuitOpen("pinned.host") {
+	if c.CircuitOpen("pinned.host", "1.2.3.4") {
 		t.Error("circuit should auto-close after open duration elapses")
 	}
 
 	// The auto-close also resets the counter — one failure alone
 	// should not re-open.
-	c.MarkRetryFailed("pinned.host")
-	if c.CircuitOpen("pinned.host") {
+	c.MarkRetryFailed("pinned.host", "1.2.3.4")
+	if c.CircuitOpen("pinned.host", "1.2.3.4") {
 		t.Error("circuit should not reopen on first failure after auto-close")
 	}
 }
@@ -425,24 +441,27 @@ func TestCircuitBreakerStatus(t *testing.T) {
 	c := NewCache(&stubSolver{}, 5*time.Minute)
 	c.SetCircuitBreakerTuning(2, 10*time.Minute)
 
-	c.MarkRetryFailed("bad.host")
-	c.MarkRetryFailed("bad.host")
-	c.MarkRetryFailed("flaky.host")
+	c.MarkRetryFailed("bad.host", "1.2.3.4")
+	c.MarkRetryFailed("bad.host", "1.2.3.4")
+	c.MarkRetryFailed("flaky.host", "1.2.3.4")
 
 	status := c.CircuitStatus()
 	if len(status) != 2 {
 		t.Errorf("status has %d entries, want 2", len(status))
 	}
-	if !status["bad.host"].Open {
-		t.Error("bad.host should be Open=true")
+	// Keys are now "host|exitIP"
+	badKey := "bad.host|1.2.3.4"
+	flakyKey := "flaky.host|1.2.3.4"
+	if !status[badKey].Open {
+		t.Errorf("%s should be Open=true", badKey)
 	}
-	if status["bad.host"].ConsecutiveFailures != 2 {
-		t.Errorf("bad.host failures = %d, want 2", status["bad.host"].ConsecutiveFailures)
+	if status[badKey].ConsecutiveFailures != 2 {
+		t.Errorf("%s failures = %d, want 2", badKey, status[badKey].ConsecutiveFailures)
 	}
-	if status["flaky.host"].Open {
-		t.Error("flaky.host should be Open=false")
+	if status[flakyKey].Open {
+		t.Errorf("%s should be Open=false", flakyKey)
 	}
-	if status["flaky.host"].ConsecutiveFailures != 1 {
-		t.Errorf("flaky.host failures = %d, want 1", status["flaky.host"].ConsecutiveFailures)
+	if status[flakyKey].ConsecutiveFailures != 1 {
+		t.Errorf("%s failures = %d, want 1", flakyKey, status[flakyKey].ConsecutiveFailures)
 	}
 }

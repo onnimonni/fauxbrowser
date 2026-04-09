@@ -61,8 +61,10 @@ type Cache struct {
 	nowFn func() time.Time
 }
 
-// circuitState tracks per-host retry-failure state for the circuit
-// breaker. Protected by Cache.mu.
+// circuitState tracks per-(host, exitIP) retry-failure state for
+// the circuit breaker. Keyed by "host|exitIP" so a host that
+// fails on one exit IP doesn't block requests on a different IP
+// that might work. Protected by Cache.mu.
 type circuitState struct {
 	consecutiveFailures int
 	openedUntil         time.Time // zero = not open
@@ -231,18 +233,18 @@ func (c *Cache) Size() int {
 // expose its name.
 func (c *Cache) Solver() Solver { return c.solver }
 
-// CircuitOpen reports whether the solver circuit for host is
-// currently open. When open, the transport should skip invoking
-// the solver on challenge responses for this host and return the
-// challenge response directly to the caller.
+// CircuitOpen reports whether the solver circuit for (host, exitIP)
+// is currently open. When open, the transport should skip invoking
+// the solver and return the challenge response directly.
 //
-// The circuit auto-closes after cbOpenFor elapses since it was
-// opened; the next call after that returns false and the transport
-// is free to try solving again.
-func (c *Cache) CircuitOpen(host string) bool {
+// Per-(host, exitIP) granularity means a host that fails on one
+// exit IP doesn't block requests on a different IP that might work.
+// The circuit auto-closes after cbOpenFor elapses.
+func (c *Cache) CircuitOpen(host, exitIP string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	st, ok := c.circuits[host]
+	key := cacheKey(host, exitIP)
+	st, ok := c.circuits[key]
 	if !ok {
 		return false
 	}
@@ -250,10 +252,6 @@ func (c *Cache) CircuitOpen(host string) bool {
 		return false
 	}
 	if c.nowFn().After(st.openedUntil) {
-		// Auto-close. Reset counters too — next failure starts
-		// over from 1. This gives the host a fresh chance to
-		// prove it's solvable post-rotation or post-WAF-config-
-		// change.
 		st.openedUntil = time.Time{}
 		st.consecutiveFailures = 0
 		return false
@@ -261,19 +259,21 @@ func (c *Cache) CircuitOpen(host string) bool {
 	return true
 }
 
-// MarkRetryFailed records that a stamped-cookie retry for host
-// STILL came back as a challenge. After cbThreshold consecutive
-// failures the circuit opens for cbOpenFor.
+// MarkRetryFailed records that a stamped-cookie retry for
+// (host, exitIP) STILL came back as a challenge. After cbThreshold
+// consecutive failures on this (host, exitIP) pair the circuit
+// opens for cbOpenFor.
 //
 // Returns true if this call transitioned the circuit from closed
 // to open (for logging).
-func (c *Cache) MarkRetryFailed(host string) bool {
+func (c *Cache) MarkRetryFailed(host, exitIP string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	st, ok := c.circuits[host]
+	key := cacheKey(host, exitIP)
+	st, ok := c.circuits[key]
 	if !ok {
 		st = &circuitState{}
-		c.circuits[host] = st
+		c.circuits[key] = st
 	}
 	st.consecutiveFailures++
 	if st.consecutiveFailures >= c.cbThreshold && st.openedUntil.IsZero() {
@@ -283,21 +283,37 @@ func (c *Cache) MarkRetryFailed(host string) bool {
 	return false
 }
 
-// MarkRetrySucceeded records that a stamped-cookie retry for host
-// cleared the challenge. Resets the consecutive-failure counter
-// and closes any open circuit. Safe to call on every successful
-// solve.
-func (c *Cache) MarkRetrySucceeded(host string) {
+// MarkRetrySucceeded records that a stamped-cookie retry for
+// (host, exitIP) cleared the challenge. Resets the failure counter
+// and closes any open circuit for this pair.
+func (c *Cache) MarkRetrySucceeded(host, exitIP string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if st, ok := c.circuits[host]; ok {
+	key := cacheKey(host, exitIP)
+	if st, ok := c.circuits[key]; ok {
 		st.consecutiveFailures = 0
 		st.openedUntil = time.Time{}
 	}
 }
 
-// CircuitStatus returns a read-only snapshot of the per-host
-// circuit state for /.internal/healthz or debugging. Keys are host names.
+// ResetCircuitsForHost closes all circuits keyed to the given host
+// (any exitIP). Used by the admin DELETE /.internal/stats/{host}
+// endpoint to give a host a fresh start after the operator fixes
+// the underlying issue.
+func (c *Cache) ResetCircuitsForHost(host string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prefix := host + "|"
+	for key, st := range c.circuits {
+		if key == host+"|" || len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			st.consecutiveFailures = 0
+			st.openedUntil = time.Time{}
+		}
+	}
+}
+
+// CircuitStatus returns a read-only snapshot of the circuit state
+// for /.internal/solver or debugging. Keys are "host|exitIP".
 func (c *Cache) CircuitStatus() map[string]CircuitStatusEntry {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

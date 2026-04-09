@@ -402,7 +402,7 @@ func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Ca
 		if r.Method == http.MethodDelete {
 			stats.ResetHost(host)
 			if solverCache != nil {
-				solverCache.MarkRetrySucceeded(host) // reset circuit breaker too
+				solverCache.ResetCircuitsForHost(host) // reset circuit breaker for all IPs
 			}
 			w.WriteHeader(http.StatusNoContent)
 			return
