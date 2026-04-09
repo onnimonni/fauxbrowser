@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,6 +24,8 @@ import (
 	"github.com/onnimonni/fauxbrowser/internal/proton"
 	"github.com/onnimonni/fauxbrowser/internal/proxy"
 	"github.com/onnimonni/fauxbrowser/internal/rotator"
+	"github.com/onnimonni/fauxbrowser/internal/solver"
+	chromedpsolver "github.com/onnimonni/fauxbrowser/internal/solver/chromedp"
 	"github.com/onnimonni/fauxbrowser/internal/wgtunnel"
 )
 
@@ -47,6 +50,10 @@ func run() error {
 	fs.StringVar(&cfg.WGPrivateKey, "wg-private-key", cfg.WGPrivateKey, "base64 WireGuard private key (alternative to -wg-conf; gluetun-style)")
 	fs.StringVar(&cfg.VPNTier, "vpn-tier", cfg.VPNTier, "server tier: free (default), paid|plus, or all")
 	fs.StringVar(&cfg.Profile, "profile", cfg.Profile, "browser profile: chrome146 (default), chrome144, chrome133, chrome131, or 'latest'")
+	fs.StringVar(&cfg.Solver, "solver", cfg.Solver, "WAF challenge solver: none (default — single binary, no Chromium dep) or chromedp (launches headless Chromium on demand)")
+	fs.DurationVar(&cfg.SolverTTL, "solver-ttl", cfg.SolverTTL, "how long to cache a solved (host, exit_ip) cookie bundle")
+	fs.DurationVar(&cfg.SolverTimeout, "solver-timeout", cfg.SolverTimeout, "max time per Chromium solve (startup + navigation + extract)")
+	fs.StringVar(&cfg.ChromiumPath, "chromium-path", cfg.ChromiumPath, "absolute Chromium binary path (default = $PATH lookup)")
 	var countriesFlag string
 	fs.StringVar(&countriesFlag, "vpn-country", strings.Join(cfg.VPNCountries, ","), "comma-separated ISO country allow-list (e.g. NL,DE)")
 	var continentsFlag string
@@ -130,8 +137,43 @@ func run() error {
 
 	pool := proton.NewPool(servers, int64(cfg.CooldownSecs), nil)
 
+	// Optional WAF challenge solver. Built BEFORE the rotator so the
+	// rotator's OnRotate hook can call cache.InvalidateExit on the
+	// outgoing exit IP — clearance cookies are exit-IP-bound and
+	// must be dropped on rotation.
+	var solverCache *solver.Cache
+	switch strings.ToLower(cfg.Solver) {
+	case "", "none":
+		// disabled — fauxbrowser stays single-binary, no Chromium dep
+	case "chromedp":
+		if !chromedpsolver.ChromiumAvailable(cfg.ChromiumPath) {
+			return fmt.Errorf("-solver chromedp: no Chromium binary on PATH (or at -chromium-path); install chromium / google-chrome / chrome and retry")
+		}
+		profile := proxy.SelectProfile(cfg.Profile)
+		ch := chromedpsolver.New(chromedpsolver.Options{
+			UpstreamProxy: "http://" + cfg.Listen,
+			UserAgent:     profile.UserAgent,
+			SolveTimeout:  cfg.SolverTimeout,
+			ChromiumPath:  cfg.ChromiumPath,
+			Logf:          func(msg string, args ...any) { slog.Info(msg, args...) },
+		})
+		solverCache = solver.NewCache(ch, cfg.SolverTTL)
+		slog.Info("WAF challenge solver enabled",
+			"solver", "chromedp", "ttl", cfg.SolverTTL.String(),
+			"timeout", cfg.SolverTimeout.String())
+	default:
+		return fmt.Errorf("-solver %q: unknown solver (valid: none, chromedp)", cfg.Solver)
+	}
+
 	var transport *proxy.Transport
-	rot := rotator.New(rotator.Options{
+	// Track the previous exit IP across rotations so the OnRotate
+	// hook knows which IP to invalidate in the solver cache.
+	var prevExitIP atomic.Pointer[string]
+	emptyIP := ""
+	prevExitIP.Store(&emptyIP)
+
+	var rot *rotator.Rotator
+	rot = rotator.New(rotator.Options{
 		BaseConfig:        baseCfg,
 		Catalog:           catalog,
 		Pool:              pool,
@@ -150,6 +192,22 @@ func run() error {
 					slog.Warn("rotator: jar rebuild failed", "err", err)
 				}
 			}
+			// Solver cache cookies are bound to the (UA, exit_ip)
+			// tuple — must drop everything for the OLD exit IP on
+			// rotation.
+			if solverCache != nil {
+				oldIP := *prevExitIP.Load()
+				if oldIP != "" {
+					dropped := solverCache.InvalidateExit(oldIP)
+					if dropped > 0 {
+						slog.Info("solver: cache invalidated for old exit IP",
+							"old_ip", oldIP, "dropped", dropped)
+					}
+				}
+			}
+			// Snapshot the new exit IP for the next rotation event.
+			newIP := rot.Stats().CurrentIP
+			prevExitIP.Store(&newIP)
 		},
 		Logf: func(msg string, args ...any) { slog.Info(msg, args...) },
 	})
@@ -167,6 +225,8 @@ func run() error {
 		TimeoutSeconds: cfg.TimeoutSecs,
 		Profile:        cfg.Profile,
 		Rotator:        rot,
+		SolverCache:    solverCache,
+		ExitIPProvider: func() string { return rot.Stats().CurrentIP },
 	})
 	if err != nil {
 		return fmt.Errorf("build transport: %w", err)
