@@ -22,7 +22,62 @@ import (
 	"strings"
 
 	"github.com/bogdanfinn/tls-client/profiles"
+	utls "github.com/bogdanfinn/utls"
+
+	"github.com/onnimonni/fauxbrowser/internal/proxy/fingerprints"
 )
+
+// chrome146Captured is a tls-client ClientProfile whose TLS
+// ClientHello is sourced from internal/proxy/fingerprints/chrome146.clienthello.hex
+// — captured from a real chromium 146 binary via `cmd/capture-fingerprint`.
+//
+// Its HTTP/2 fingerprint (SETTINGS frame, pseudo-header order,
+// connection flow, priorities, HPACK config) is inherited from
+// bogdanfinn/tls-client's built-in `profiles.Chrome_146`. That h2
+// fingerprint is relatively stable across Chrome versions; the TLS
+// ClientHello is not, and was shown to drift by exactly one
+// extension between bogdanfinn's Chrome_146 snapshot and real
+// chromium 146 (see the tls_fingerprint_ci JA4 test evidence).
+//
+// We use bogdanfinn/utls's `ClientHelloID.SpecFactory` escape hatch
+// to inject our own `ClientHelloSpec` — tls-client dispatches to
+// SpecFactory when Client == "Custom" or when SpecFactory is non-nil,
+// bypassing the built-in profile table entirely.
+//
+// Regenerate the hex file with:
+//
+//	go run ./cmd/capture-fingerprint \
+//	    -out internal/proxy/fingerprints/chrome146.clienthello.hex
+var chrome146Captured = func() profiles.ClientProfile {
+	base := profiles.Chrome_146
+	customID := utls.ClientHelloID{
+		Client:  "Chrome146Captured",
+		Version: "custom",
+		SpecFactory: func() (utls.ClientHelloSpec, error) {
+			spec, err := fingerprints.Chrome146()
+			if err != nil {
+				return utls.ClientHelloSpec{}, err
+			}
+			return *spec, nil
+		},
+	}
+	return profiles.NewClientProfile(
+		customID,
+		base.GetSettings(),
+		base.GetSettingsOrder(),
+		base.GetPseudoHeaderOrder(),
+		base.GetConnectionFlow(),
+		base.GetPriorities(),
+		base.GetHeaderPriority(),
+		base.GetStreamID(),
+		base.GetAllowHTTP(),
+		base.GetHttp3Settings(),
+		base.GetHttp3SettingsOrder(),
+		base.GetHttp3PriorityParam(),
+		base.GetHttp3PseudoHeaderOrder(),
+		base.GetHttp3SendGreaseFrames(),
+	)
+}()
 
 // BrowserProfile bundles a TLS fingerprint with the matching
 // application-layer headers.
@@ -55,7 +110,7 @@ var profileTable = map[string]BrowserProfile{
 	"chrome146": {
 		Name:       "chrome146",
 		Major:      146,
-		TLSProfile: profiles.Chrome_146,
+		TLSProfile: chrome146Captured,
 		UserAgent:  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
 		SecChUa:    `"Chromium";v="146", "Not.A/Brand";v="24", "Google Chrome";v="146"`,
 		SecChUaMob: "?0",
@@ -105,6 +160,22 @@ func SelectProfile(name string) BrowserProfile {
 		return profileTable[DefaultProfile]
 	}
 	return p
+}
+
+// SelectProfileForMajor returns the profile entry whose Major matches
+// the given Chrome major version, plus ok=true. When no profile in the
+// table matches, returns the zero BrowserProfile and ok=false.
+//
+// Used by fauxbrowser to auto-align the tls-client fingerprint with
+// whatever Chromium the chromedp solver is going to launch — so both
+// paths present the same Chrome major version to the origin.
+func SelectProfileForMajor(major int) (BrowserProfile, bool) {
+	for _, p := range profileTable {
+		if p.Major == major {
+			return p, true
+		}
+	}
+	return BrowserProfile{}, false
 }
 
 // KnownProfiles returns the sorted list of profile names.

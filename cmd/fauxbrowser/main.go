@@ -54,6 +54,10 @@ func run() error {
 	fs.DurationVar(&cfg.SolverTTL, "solver-ttl", cfg.SolverTTL, "how long to cache a solved (host, exit_ip) cookie bundle")
 	fs.DurationVar(&cfg.SolverTimeout, "solver-timeout", cfg.SolverTimeout, "max time per Chromium solve (startup + navigation + extract)")
 	fs.StringVar(&cfg.ChromiumPath, "chromium-path", cfg.ChromiumPath, "absolute Chromium binary path (default = $PATH lookup)")
+	fs.BoolVar(&cfg.AllowVersionMismatch, "allow-version-mismatch", cfg.AllowVersionMismatch,
+		"start even if chromedp solver's Chromium has a Chrome major version that has no matching tls-client profile "+
+			"(or disagrees with an explicit -profile). Use when nixpkgs chromium just got bumped to N+1 and bogdanfinn/tls-client "+
+			"hasn't shipped chromeN+1 yet — solver and fast-path TLS fingerprints will differ, cookie portability on JA3-pinning WAFs is at risk")
 	var countriesFlag string
 	fs.StringVar(&countriesFlag, "vpn-country", strings.Join(cfg.VPNCountries, ","), "comma-separated ISO country allow-list (e.g. NL,DE)")
 	var continentsFlag string
@@ -141,7 +145,18 @@ func run() error {
 	// rotator's OnRotate hook can call cache.InvalidateExit on the
 	// outgoing exit IP — clearance cookies are exit-IP-bound and
 	// must be dropped on rotation.
+	//
+	// When the solver is enabled we ALSO detect chromium's Chrome
+	// major version and reconcile it against the requested profile.
+	// A mismatch means the solver's ClientHello and the fast-path
+	// ClientHello differ by at least a major version — cookies that
+	// are JA3-pinned by the WAF (some aggressive Cloudflare customers
+	// bind cf_clearance to the solving browser's TLS fingerprint)
+	// will not port from the solver to the fast path. We refuse to
+	// start in that case unless the operator explicitly passes
+	// -allow-version-mismatch.
 	var solverCache *solver.Cache
+	var chromiumMajor int
 	switch strings.ToLower(cfg.Solver) {
 	case "", "none":
 		// disabled — fauxbrowser stays single-binary, no Chromium dep
@@ -149,6 +164,26 @@ func run() error {
 		if !chromedpsolver.ChromiumAvailable(cfg.ChromiumPath) {
 			return fmt.Errorf("-solver chromedp: no Chromium binary on PATH (or at -chromium-path); install chromium / google-chrome / chrome and retry")
 		}
+		m, err := chromedpsolver.DetectChromiumMajor(cfg.ChromiumPath)
+		if err != nil {
+			return fmt.Errorf("-solver chromedp: detect chromium version: %w", err)
+		}
+		chromiumMajor = m
+		slog.Info("solver: chromium detected", "chrome_major", m, "path", cfg.ChromiumPath)
+	default:
+		return fmt.Errorf("-solver %q: unknown solver (valid: none, chromedp)", cfg.Solver)
+	}
+
+	// Reconcile the browser profile against the detected chromium
+	// major (if any). When no solver is active, chromiumMajor=0 and
+	// the reconciler is a no-op pass-through to SelectProfile.
+	resolvedProfile, err := proxy.ReconcileProfile(cfg.Profile, chromiumMajor, cfg.AllowVersionMismatch)
+	if err != nil {
+		return err
+	}
+	cfg.Profile = resolvedProfile
+
+	if chromiumMajor > 0 {
 		profile := proxy.SelectProfile(cfg.Profile)
 		ch := chromedpsolver.New(chromedpsolver.Options{
 			UpstreamProxy: "http://" + cfg.Listen,
@@ -159,10 +194,11 @@ func run() error {
 		})
 		solverCache = solver.NewCache(ch, cfg.SolverTTL)
 		slog.Info("WAF challenge solver enabled",
-			"solver", "chromedp", "ttl", cfg.SolverTTL.String(),
+			"solver", "chromedp",
+			"profile", profile.Name,
+			"chromium_major", chromiumMajor,
+			"ttl", cfg.SolverTTL.String(),
 			"timeout", cfg.SolverTimeout.String())
-	default:
-		return fmt.Errorf("-solver %q: unknown solver (valid: none, chromedp)", cfg.Solver)
 	}
 
 	var transport *proxy.Transport
