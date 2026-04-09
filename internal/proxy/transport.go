@@ -235,7 +235,7 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 			if t.opts.Stats != nil {
 				t.opts.Stats.RecordChallenge(host, exitIP)
 			}
-			if t.opts.SolverCache.CircuitOpen(host) {
+			if t.opts.SolverCache.CircuitOpen(host, exitIP) {
 				slog.Warn("solver path: circuit open for host, skipping solver",
 					"host", host, "exit_ip", exitIP, "kind", kind.String(),
 					"status", resp.StatusCode)
@@ -262,7 +262,7 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 					resp = retryResp
 					if solver.DetectChallenge(retryResp.StatusCode, retryResp.Header).Solvable() {
 						t.opts.SolverCache.Invalidate(host, exitIP)
-						opened := t.opts.SolverCache.MarkRetryFailed(host)
+						opened := t.opts.SolverCache.MarkRetryFailed(host, exitIP)
 						if t.opts.Stats != nil {
 							t.opts.Stats.RecordSolverFailed(host)
 						}
@@ -277,7 +277,7 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 								"host", host, "exit_ip", exitIP, "status", retryResp.StatusCode)
 						}
 					} else {
-						t.opts.SolverCache.MarkRetrySucceeded(host)
+						t.opts.SolverCache.MarkRetrySucceeded(host, exitIP)
 						if t.opts.Stats != nil {
 							t.opts.Stats.RecordSolverSuccess(host)
 						}
