@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	nurl "net/url"
 	"strings"
@@ -9,6 +10,8 @@ import (
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
+
+	"github.com/onnimonni/fauxbrowser/internal/solver"
 )
 
 // TransportOptions parameterize the tls-client pool.
@@ -21,6 +24,16 @@ type TransportOptions struct {
 	ProfileHeader string // e.g. "X-Fauxbrowser-Profile"
 	SessionHeader string // e.g. "X-Fauxbrowser-Session"
 	MaxSessions   int
+
+	// SolverCache is optional. When set, responses that look like a WAF
+	// challenge trigger a solve via the wrapped Solver; resulting cookies
+	// are stamped on the request and the upstream is re-fetched once.
+	SolverCache  *solver.Cache
+	// SolverEgress is the proxy URL the solver itself should egress via.
+	// Typically differs from UpstreamProxy because the solver runs in its
+	// own container and can't reach host-local addresses. Empty falls
+	// back to UpstreamProxy.
+	SolverEgress string
 }
 
 // Transport is an http.RoundTripper backed by a pool of tls-client clients,
@@ -134,17 +147,81 @@ func (t *Transport) buildClient(profile, session string) (tls_client.HttpClient,
 
 // RoundTrip implements http.RoundTripper. Body is streamed; context from
 // the incoming request is propagated so client disconnects cancel upstream.
+// When a SolverCache is configured and the upstream response looks like a
+// WAF challenge, fauxbrowser invokes the solver, stamps the resulting
+// cookies + User-Agent on the request, and re-fetches once.
 func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	profile := firstNonEmpty(r.Header.Get(t.opts.ProfileHeader), t.opts.DefaultProfile)
 	session := r.Header.Get(t.opts.SessionHeader)
 
+	// Proactively stamp cookies from a prior solve so repeat requests
+	// don't re-trigger the solver on every hit.
+	var primeCookies []*http.Cookie
+	var primeUA string
+	if t.opts.SolverCache != nil {
+		if prior := t.opts.SolverCache.Peek(session, r.URL.Host); prior != nil {
+			primeCookies = prior.Cookies
+			primeUA = prior.UserAgent
+		}
+	}
+
+	resp, err := t.dispatch(r, profile, session, primeCookies, primeUA)
+	if err != nil {
+		return nil, err
+	}
+	if t.opts.SolverCache == nil || t.opts.SolverCache.Solver() == nil {
+		return resp, nil
+	}
+	if !solver.LooksLikeChallenge(resp.StatusCode, resp.Header) {
+		return resp, nil
+	}
+	// If we had primed with stale cached cookies, drop them so the solver
+	// gets called fresh.
+	if primeCookies != nil {
+		t.opts.SolverCache.Invalidate(session, r.URL.Host)
+	}
+
+	slog.Info("challenge detected, invoking solver",
+		"status", resp.StatusCode, "host", r.URL.Host, "session", session)
+	// Drop the challenge response body — we'll replace the whole response.
+	_ = resp.Body.Close()
+
+	solverEgress := t.opts.SolverEgress
+	if solverEgress == "" {
+		solverEgress = t.opts.UpstreamProxy
+	}
+	result, solveErr := t.opts.SolverCache.LookupOrSolve(
+		r.Context(), session, r.URL, solverEgress)
+	if solveErr != nil || result == nil {
+		slog.Warn("solver failed; returning original challenge response",
+			"err", solveErr)
+		// Re-issue the fetch so the caller at least sees a body.
+		return t.dispatch(r, profile, session, nil, "")
+	}
+
+	retryResp, err := t.dispatch(r, profile, session, result.Cookies, result.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+	// If the retry STILL looks like a challenge, invalidate and bail —
+	// the cached cookies are stale or the solver's IP no longer matches.
+	if solver.LooksLikeChallenge(retryResp.StatusCode, retryResp.Header) {
+		slog.Warn("re-fetch after solve still challenged; invalidating",
+			"host", r.URL.Host)
+		t.opts.SolverCache.Invalidate(session, r.URL.Host)
+	}
+	return retryResp, nil
+}
+
+// dispatch performs one upstream fetch via the (profile, session) client.
+// Optional stampCookies/stampUA override the request cookies/UA — used by
+// the solver retry path.
+func (t *Transport) dispatch(r *http.Request, profile, session string, stampCookies []*http.Cookie, stampUA string) (*http.Response, error) {
 	client, err := t.clientFor(profile, session)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build headers to forward — drop fauxbrowser control headers and
-	// hop-by-hop headers per RFC 7230.
 	egress := cloneHeader(r.Header)
 	for _, h := range []string{
 		t.opts.ProfileHeader,
@@ -162,12 +239,23 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	for _, h := range staticHopByHop {
 		egress.Del(h)
 	}
-
-	// Fill in browser-plausible default headers (UA/Accept/etc.) when
-	// the caller did not set them. Curl's default "User-Agent: curl/..."
-	// is treated as unset since it reliably defeats the whole point of
-	// TLS fingerprint forging.
 	egress = applyDefaults(egress, profile)
+
+	if stampUA != "" {
+		egress.Set("User-Agent", stampUA)
+	}
+	if len(stampCookies) > 0 {
+		// Merge into any existing Cookie header.
+		existing := egress.Get("Cookie")
+		var parts []string
+		if existing != "" {
+			parts = append(parts, existing)
+		}
+		for _, c := range stampCookies {
+			parts = append(parts, c.Name+"="+c.Value)
+		}
+		egress.Set("Cookie", strings.Join(parts, "; "))
+	}
 
 	body := r.Body
 	if body == nil {
@@ -179,16 +267,21 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	freq.ContentLength = r.ContentLength
 	freq.Host = r.Host
+	// Replace tls-client's per-profile default headers with ours. tls-client
+	// pre-populates freq.Header (including an older User-Agent) from the
+	// selected ClientProfile; using Set + Del guarantees our values win.
 	for k, vs := range egress {
 		ck := fhttp.CanonicalHeaderKey(k)
-		freq.Header[ck] = append(freq.Header[ck], vs...)
+		freq.Header.Del(ck)
+		for _, v := range vs {
+			freq.Header.Add(ck, v)
+		}
 	}
 
 	fresp, err := client.Do(freq)
 	if err != nil {
 		return nil, err
 	}
-	// Stream — do not read body.
 	out := &http.Response{
 		Status:        fresp.Status,
 		StatusCode:    fresp.StatusCode,

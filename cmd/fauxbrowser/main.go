@@ -18,6 +18,8 @@ import (
 	"github.com/onnimonni/fauxbrowser/internal/ca"
 	"github.com/onnimonni/fauxbrowser/internal/config"
 	"github.com/onnimonni/fauxbrowser/internal/proxy"
+	"github.com/onnimonni/fauxbrowser/internal/solver"
+	"github.com/onnimonni/fauxbrowser/internal/solver/flaresolverr"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=<sha>".
@@ -52,6 +54,10 @@ func run() error {
 	fs.IntVar(&cfg.SessionMax, "session-max", cfg.SessionMax, "max concurrent tls-client sessions in pool")
 	fs.BoolVar(&cfg.Insecure, "insecure", cfg.Insecure, "skip upstream TLS verification (tests only)")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "debug|info|warn|error")
+	fs.StringVar(&cfg.Solver, "solver", cfg.Solver, "challenge solver: flaresolverr (empty = disabled)")
+	fs.StringVar(&cfg.SolverURL, "solver-url", cfg.SolverURL, "URL of the challenge solver backend (e.g. http://127.0.0.1:8191)")
+	fs.StringVar(&cfg.SolverEgress, "solver-egress", cfg.SolverEgress, "HTTP proxy URL the solver should egress through (defaults to -upstream). Must be reachable from the solver container.")
+	fs.DurationVar(&cfg.SolverTTL, "solver-ttl", cfg.SolverTTL, "how long to reuse a solved cookie bundle per (session, domain)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	_ = fs.Parse(os.Args[1:])
 
@@ -78,6 +84,22 @@ func run() error {
 	}
 	leafCache := ca.NewLeafCache(pair, cfg.LeafCacheMax)
 
+	// Optional WAF challenge solver.
+	var solverCache *solver.Cache
+	switch strings.ToLower(cfg.Solver) {
+	case "":
+		// disabled
+	case "flaresolverr":
+		if cfg.SolverURL == "" {
+			return fmt.Errorf("-solver flaresolverr requires -solver-url")
+		}
+		fs := flaresolverr.New(cfg.SolverURL)
+		solverCache = solver.NewCache(fs, cfg.SolverTTL)
+		slog.Info("challenge solver enabled", "solver", "flaresolverr", "url", cfg.SolverURL)
+	default:
+		return fmt.Errorf("unknown -solver %q", cfg.Solver)
+	}
+
 	// Transport (tls-client pool).
 	transport := proxy.NewTransport(proxy.TransportOptions{
 		DefaultProfile: cfg.Profile,
@@ -87,6 +109,8 @@ func run() error {
 		ProfileHeader:  cfg.ProfileHdr,
 		SessionHeader:  cfg.SessionHdr,
 		MaxSessions:    cfg.SessionMax,
+		SolverCache:    solverCache,
+		SolverEgress:   cfg.SolverEgress,
 	})
 	defer transport.Close()
 

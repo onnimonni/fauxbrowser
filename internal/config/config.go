@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -26,6 +27,11 @@ type Config struct {
 	SessionMax   int
 	Insecure     bool // skip TLS verify on upstream (tests only)
 	LogLevel     string
+
+	Solver       string        // "", "flaresolverr"
+	SolverURL    string        // e.g. http://127.0.0.1:8191
+	SolverEgress string        // proxy URL the solver should use as ITS egress
+	SolverTTL    time.Duration // cache lifetime for solved cookies
 }
 
 func Default() *Config {
@@ -39,6 +45,7 @@ func Default() *Config {
 		LeafCacheMax: 1024,
 		SessionMax:   256,
 		LogLevel:     "info",
+		SolverTTL:    25 * time.Minute,
 	}
 }
 
@@ -82,6 +89,20 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("FAUXBROWSER_LOG_LEVEL"); v != "" {
 		c.LogLevel = v
+	}
+	if v := os.Getenv("FAUXBROWSER_SOLVER"); v != "" {
+		c.Solver = v
+	}
+	if v := os.Getenv("FAUXBROWSER_SOLVER_URL"); v != "" {
+		c.SolverURL = v
+	}
+	if v := os.Getenv("FAUXBROWSER_SOLVER_EGRESS"); v != "" {
+		c.SolverEgress = v
+	}
+	if v := os.Getenv("FAUXBROWSER_SOLVER_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.SolverTTL = d
+		}
 	}
 }
 
