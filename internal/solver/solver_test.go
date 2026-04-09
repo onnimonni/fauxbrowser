@@ -202,14 +202,14 @@ func TestCacheSaveAndLoad(t *testing.T) {
 	}
 
 	// Save to temp file.
-	tmpFile := t.TempDir() + "/cookies.json"
-	if err := c.SaveToFile(tmpFile); err != nil {
+	tmpDir := t.TempDir()
+	if err := c.SaveToDir(tmpDir); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
 	// Load into a fresh cache.
 	c2 := NewCache(stub, 1*time.Hour)
-	loaded, err := c2.LoadFromFile(tmpFile)
+	loaded, err := c2.LoadFromDir(tmpDir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -239,13 +239,13 @@ func TestCacheLoadSkipsExpired(t *testing.T) {
 	target, _ := url.Parse("https://example.com/")
 	_, _ = c.LookupOrSolve(context.Background(), target, "1.2.3.4")
 
-	tmpFile := t.TempDir() + "/cookies.json"
-	_ = c.SaveToFile(tmpFile)
+	tmpDir := t.TempDir()
+	_ = c.SaveToDir(tmpDir)
 
 	// Advance clock past expiry.
 	c2 := NewCache(stub, 1*time.Millisecond)
 	c2.nowFn = func() time.Time { return now.Add(1 * time.Hour) }
-	loaded, _ := c2.LoadFromFile(tmpFile)
+	loaded, _ := c2.LoadFromDir(tmpDir)
 	if loaded != 0 {
 		t.Errorf("expired entries should not be loaded, got %d", loaded)
 	}

@@ -54,7 +54,7 @@ func run() error {
 	fs.DurationVar(&cfg.SolverTTL, "solver-ttl", cfg.SolverTTL, "how long to cache a solved (host, exit_ip) cookie bundle")
 	fs.DurationVar(&cfg.SolverTimeout, "solver-timeout", cfg.SolverTimeout, "max time per Chromium solve (startup + navigation + extract)")
 	fs.StringVar(&cfg.ChromiumPath, "chromium-path", cfg.ChromiumPath, "absolute Chromium binary path (default = $PATH lookup)")
-	fs.StringVar(&cfg.CookieStorePath, "cookie-store", cfg.CookieStorePath, "file path for persisting CF cookie cache across restarts (empty = in-memory only)")
+	fs.StringVar(&cfg.CookieStorePath, "cookie-store", cfg.CookieStorePath, "directory for persisting CF cookie cache — one file per (host, exitIP), survives restarts (empty = in-memory only)")
 	fs.BoolVar(&cfg.AllowVersionMismatch, "allow-version-mismatch", cfg.AllowVersionMismatch,
 		"start even if chromedp solver's Chromium has a Chrome major version that has no matching tls-client profile "+
 			"(or disagrees with an explicit -profile). Use when nixpkgs chromium just got bumped to N+1 and bogdanfinn/tls-client "+
@@ -194,14 +194,16 @@ func run() error {
 			Logf:          func(msg string, args ...any) { slog.Info(msg, args...) },
 		})
 		solverCache = solver.NewCache(ch, cfg.SolverTTL)
-		// Restore persisted cookies from a previous run.
+		// Restore persisted cookies from a previous run and enable
+		// auto-persist for every future solve/invalidation.
 		if cfg.CookieStorePath != "" {
-			if n, err := solverCache.LoadFromFile(cfg.CookieStorePath); err != nil {
+			solverCache.SetStoreDir(cfg.CookieStorePath)
+			if n, err := solverCache.LoadFromDir(cfg.CookieStorePath); err != nil {
 				if !os.IsNotExist(err) {
-					slog.Warn("solver: could not load cookie store", "path", cfg.CookieStorePath, "err", err)
+					slog.Warn("solver: could not load cookie store", "dir", cfg.CookieStorePath, "err", err)
 				}
 			} else if n > 0 {
-				slog.Info("solver: restored cookies from disk", "path", cfg.CookieStorePath, "loaded", n)
+				slog.Info("solver: restored cookies from disk", "dir", cfg.CookieStorePath, "loaded", n)
 			}
 		}
 		slog.Info("WAF challenge solver enabled",
@@ -251,11 +253,11 @@ func run() error {
 			newIP := rot.Stats().CurrentIP
 			prevExitIP.Store(&newIP)
 
-			// Persist solver cache to disk if a store path is
-			// configured.
+			// Full sync to disk on rotation in case new entries
+			// were added since the last per-entry auto-persist.
 			if solverCache != nil && cfg.CookieStorePath != "" {
-				if err := solverCache.SaveToFile(cfg.CookieStorePath); err != nil {
-					slog.Warn("solver: disk save failed", "err", err)
+				if err := solverCache.SaveToDir(cfg.CookieStorePath); err != nil {
+					slog.Warn("solver: disk sync failed", "err", err)
 				}
 			}
 		},
@@ -341,10 +343,10 @@ func run() error {
 	}
 	// Persist solver cookies on clean shutdown.
 	if solverCache != nil && cfg.CookieStorePath != "" {
-		if err := solverCache.SaveToFile(cfg.CookieStorePath); err != nil {
+		if err := solverCache.SaveToDir(cfg.CookieStorePath); err != nil {
 			slog.Warn("solver: cookie store save on shutdown failed", "err", err)
 		} else {
-			slog.Info("solver: cookie store saved", "path", cfg.CookieStorePath, "entries", solverCache.Size())
+			slog.Info("solver: cookie store saved", "dir", cfg.CookieStorePath, "entries", solverCache.Size())
 		}
 	}
 	return nil

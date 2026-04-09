@@ -183,12 +183,14 @@ in
 
     cookieStorePath = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
-      default = "/var/lib/fauxbrowser/cookies.json";
+      default = "/var/lib/fauxbrowser/cookies";
       description = ''
-        File path for persisting the solver's CF cookie cache to
-        disk. Cookies are saved on every VPN rotation and on clean
-        shutdown, and restored on startup — so solved CF sessions
-        survive process restarts without re-solving.
+        Directory for persisting the solver's CF cookie cache to disk.
+        One JSON file per (host, exitIP) pair — O(1) per-entry writes,
+        crash-safe, and inspectable via ls/cat.
+
+        Cookies auto-persist on every solve and are restored on startup.
+        Solved CF sessions survive process restarts without re-solving.
 
         Set to `null` to disable disk persistence (in-memory only).
         Ignored when `solver = "none"`.

@@ -47,6 +47,10 @@ type Cache struct {
 	cbThreshold int           // consecutive MarkRetryFailed to open the circuit
 	cbOpenFor   time.Duration // how long the circuit stays open after threshold
 
+	// storeDir is the directory for per-entry cookie persistence.
+	// Empty = no disk persistence.
+	storeDir string
+
 	mu       sync.RWMutex
 	entries  map[string]*cacheEntry
 	circuits map[string]*circuitState // keyed by host
@@ -86,6 +90,15 @@ func NewCache(solver Solver, ttl time.Duration) *Cache {
 		circuits:    make(map[string]*circuitState),
 		nowFn:       time.Now,
 	}
+}
+
+// SetStoreDir sets the directory for per-entry cookie persistence.
+// When set, every successful solve auto-persists the entry to disk,
+// and every invalidation deletes the file.
+func (c *Cache) SetStoreDir(dir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.storeDir = dir
 }
 
 // SetCircuitBreakerTuning overrides the default threshold and
@@ -155,7 +168,7 @@ func (c *Cache) LookupOrSolve(ctx context.Context, target *url.URL, exitIP strin
 func (c *Cache) store(host, exitIP string, sol *Solution) {
 	sol.hostHint = host // for disk persistence reconstruction
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	storeDir := c.storeDir
 	expiry := time.Time{}
 	if c.ttl > 0 {
 		expiry = c.nowFn().Add(c.ttl)
@@ -165,6 +178,14 @@ func (c *Cache) store(host, exitIP string, sol *Solution) {
 		expiry:   expiry,
 		exitIP:   exitIP,
 	}
+	c.mu.Unlock()
+
+	// Auto-persist to disk outside the lock.
+	if storeDir != "" {
+		if err := c.SaveEntry(storeDir, host, exitIP); err != nil {
+			slog.Warn("solver: auto-persist failed", "host", host, "err", err)
+		}
+	}
 }
 
 // Invalidate drops the cached entry for (host, exitIP). Called by
@@ -172,8 +193,13 @@ func (c *Cache) store(host, exitIP string, sol *Solution) {
 // cookie was stale.
 func (c *Cache) Invalidate(host, exitIP string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	storeDir := c.storeDir
 	delete(c.entries, cacheKey(host, exitIP))
+	c.mu.Unlock()
+
+	if storeDir != "" {
+		c.DeleteEntry(storeDir, host, exitIP)
+	}
 }
 
 // InvalidateExit drops every entry bound to a given exit IP. The
@@ -300,7 +326,19 @@ type CircuitStatusEntry struct {
 	OpenFor             time.Duration
 }
 
-// --- disk persistence ---
+// --- disk persistence (directory-based, one file per entry) ---
+//
+// Each (host, exitIP) pair is stored as a separate JSON file in a
+// directory. Filenames are "{host}@{exitIP}.json" — both hostname
+// and IPv4 are filename-safe, and "@" is not valid in either.
+//
+// Benefits over a single JSON blob:
+//   - O(1) per-entry writes: only the changed entry is rewritten.
+//   - Crash-safe: a crash mid-write corrupts at most one entry.
+//   - Inspectable: `ls /var/lib/fauxbrowser/cookies/` lists all
+//     cached sessions; `cat` any file to see the cookies.
+//   - Filesystem IS the index: no need to parse a large file on
+//     startup to find one entry.
 
 // persistEntry is the JSON-serializable form of a cacheEntry.
 type persistEntry struct {
@@ -312,22 +350,66 @@ type persistEntry struct {
 	Expiry   time.Time      `json:"expiry"`
 }
 
-// SaveToFile serializes the current cache entries to a JSON file.
-// Only entries with unexpired cookies are written. Circuit-breaker
-// state is NOT persisted (it's ephemeral and resets on restart).
-//
-// The file is written atomically: write to a temp file in the same
-// directory, then rename. Safe for concurrent reads by external
-// tools.
-func (c *Cache) SaveToFile(path string) error {
+// entryFilename returns the filename for a (host, exitIP) pair.
+func entryFilename(host, exitIP string) string {
+	return host + "@" + exitIP + ".json"
+}
+
+// SaveEntry persists a single cache entry to disk. Called after
+// every successful solve. Atomic via temp-file + rename.
+func (c *Cache) SaveEntry(dir, host, exitIP string) error {
+	c.mu.RLock()
+	e, ok := c.entries[cacheKey(host, exitIP)]
+	if !ok {
+		c.mu.RUnlock()
+		return nil // nothing to save
+	}
+	pe := persistEntry{
+		Host:     host,
+		ExitIP:   exitIP,
+		Cookies:  e.solution.Cookies,
+		UA:       e.solution.UserAgent,
+		SolvedAt: e.solution.SolvedAt,
+		Expiry:   e.expiry,
+	}
+	c.mu.RUnlock()
+
+	data, err := json.MarshalIndent(pe, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, entryFilename(host, exitIP)+".tmp")
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, entryFilename(host, exitIP)))
+}
+
+// DeleteEntry removes a single cache entry from disk. Called on
+// CF-specific 403 invalidation.
+func (c *Cache) DeleteEntry(dir, host, exitIP string) {
+	path := filepath.Join(dir, entryFilename(host, exitIP))
+	_ = os.Remove(path)
+}
+
+// SaveToDir persists all unexpired cache entries to a directory.
+// Each entry is written as a separate JSON file. Useful for
+// periodic full sync or clean shutdown.
+func (c *Cache) SaveToDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
 	c.mu.RLock()
 	now := c.nowFn()
-	var entries []persistEntry
+	var toSave []persistEntry
 	for _, e := range c.entries {
 		if c.ttl > 0 && now.After(e.expiry) {
-			continue // skip expired
+			continue
 		}
-		entries = append(entries, persistEntry{
+		toSave = append(toSave, persistEntry{
 			Host:     e.solution.hostHint,
 			ExitIP:   e.exitIP,
 			Cookies:  e.solution.Cookies,
@@ -338,44 +420,57 @@ func (c *Cache) SaveToFile(path string) error {
 	}
 	c.mu.RUnlock()
 
-	data, err := json.MarshalIndent(entries, "", "  ")
-	if err != nil {
-		return err
+	for _, pe := range toSave {
+		data, err := json.MarshalIndent(pe, "", "  ")
+		if err != nil {
+			return err
+		}
+		tmp := filepath.Join(dir, entryFilename(pe.Host, pe.ExitIP)+".tmp")
+		if err := os.WriteFile(tmp, data, 0o600); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, filepath.Join(dir, entryFilename(pe.Host, pe.ExitIP))); err != nil {
+			return err
+		}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return nil
 }
 
-// LoadFromFile restores cache entries from a JSON file previously
-// written by SaveToFile. Expired entries are skipped. Entries that
-// conflict with existing in-memory entries are skipped (in-memory
-// wins). Returns the number of entries loaded.
-func (c *Cache) LoadFromFile(path string) (int, error) {
-	data, err := os.ReadFile(path)
+// LoadFromDir restores cache entries from a directory previously
+// written by SaveToDir or SaveEntry. Expired entries are skipped
+// and their files are deleted. Entries that conflict with existing
+// in-memory entries are skipped (in-memory wins). Returns the
+// number of entries loaded.
+func (c *Cache) LoadFromDir(dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return 0, err
-	}
-	var entries []persistEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
 		return 0, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.nowFn()
-	loaded := 0
-	for _, pe := range entries {
+	loaded, expired := 0, 0
+	for _, de := range entries {
+		if de.IsDir() || filepath.Ext(de.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, de.Name()))
+		if err != nil {
+			continue
+		}
+		var pe persistEntry
+		if err := json.Unmarshal(data, &pe); err != nil {
+			continue
+		}
 		if c.ttl > 0 && now.After(pe.Expiry) {
+			// Clean up expired files from disk.
+			_ = os.Remove(filepath.Join(dir, de.Name()))
+			expired++
 			continue
 		}
 		key := cacheKey(pe.Host, pe.ExitIP)
 		if _, exists := c.entries[key]; exists {
-			continue // in-memory wins
+			continue
 		}
 		c.entries[key] = &cacheEntry{
 			solution: &Solution{
@@ -390,6 +485,28 @@ func (c *Cache) LoadFromFile(path string) (int, error) {
 		loaded++
 	}
 	slog.Info("solver: loaded cookie cache from disk",
-		"path", path, "loaded", loaded, "skipped_expired", len(entries)-loaded)
+		"dir", dir, "loaded", loaded, "expired_cleaned", expired)
 	return loaded, nil
+}
+
+// Backward-compat aliases for callers that haven't migrated yet.
+
+// SaveToFile is a backward-compatible alias for SaveToDir.
+// If path ends in ".json", it uses the parent directory.
+func (c *Cache) SaveToFile(path string) error {
+	dir := path
+	if filepath.Ext(path) == ".json" {
+		dir = filepath.Dir(path)
+	}
+	return c.SaveToDir(dir)
+}
+
+// LoadFromFile is a backward-compatible alias for LoadFromDir.
+// If path ends in ".json", it uses the parent directory.
+func (c *Cache) LoadFromFile(path string) (int, error) {
+	dir := path
+	if filepath.Ext(path) == ".json" {
+		dir = filepath.Dir(path)
+	}
+	return c.LoadFromDir(dir)
 }
