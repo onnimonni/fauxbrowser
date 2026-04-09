@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -177,5 +178,271 @@ func TestCacheSolveErrorNotCached(t *testing.T) {
 	_, _ = c.LookupOrSolve(context.Background(), target, "1.2.3.4")
 	if got := stub.calls.Load(); got != 2 {
 		t.Errorf("solver called %d times, want 2 (no cache on error)", got)
+	}
+}
+
+// --- disk persistence ---
+
+func TestCacheSaveAndLoad(t *testing.T) {
+	stub := &stubSolver{
+		cookies: []*http.Cookie{
+			{Name: "cf_clearance", Value: "abc123"},
+			{Name: "__cf_bm", Value: "bm456"},
+		},
+	}
+	c := NewCache(stub, 1*time.Hour)
+	target, _ := url.Parse("https://example.com/")
+
+	// Solve and cache an entry.
+	_, err := c.LookupOrSolve(context.Background(), target, "1.2.3.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Size() != 1 {
+		t.Fatalf("expected 1 entry, got %d", c.Size())
+	}
+
+	// Save to temp file.
+	tmpDir := t.TempDir()
+	if err := c.SaveToDir(tmpDir); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Load into a fresh cache.
+	c2 := NewCache(stub, 1*time.Hour)
+	loaded, err := c2.LoadFromDir(tmpDir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded != 1 {
+		t.Errorf("loaded %d entries, want 1", loaded)
+	}
+
+	// Verify the loaded entry is usable.
+	sol := c2.Lookup("example.com", "1.2.3.4")
+	if sol == nil {
+		t.Fatal("loaded entry not found via Lookup")
+	}
+	if sol.Cookie("cf_clearance") != "abc123" {
+		t.Errorf("cf_clearance = %q, want abc123", sol.Cookie("cf_clearance"))
+	}
+}
+
+func TestCacheDirLayout(t *testing.T) {
+	stub := &stubSolver{
+		cookies: []*http.Cookie{{Name: "cf_clearance", Value: "v1"}},
+	}
+	c := NewCache(stub, 1*time.Hour)
+	target1, _ := url.Parse("https://www.k-ruoka.fi/")
+	target2, _ := url.Parse("https://example.com/")
+
+	_, _ = c.LookupOrSolve(context.Background(), target1, "1.2.3.4")
+	_, _ = c.LookupOrSolve(context.Background(), target2, "5.6.7.8")
+
+	dir := t.TempDir()
+	if err := c.SaveToDir(dir); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Verify hostname-partitioned directory layout:
+	//   {dir}/www.k-ruoka.fi/1.2.3.4.json
+	//   {dir}/example.com/5.6.7.8.json
+	for _, want := range []string{
+		"www.k-ruoka.fi/1.2.3.4.json",
+		"example.com/5.6.7.8.json",
+	} {
+		full := dir + "/" + want
+		if _, err := os.Stat(full); err != nil {
+			t.Errorf("expected file %s, got error: %v", want, err)
+		}
+	}
+
+	// Verify round-trip load.
+	c2 := NewCache(stub, 1*time.Hour)
+	loaded, err := c2.LoadFromDir(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded != 2 {
+		t.Errorf("loaded %d, want 2", loaded)
+	}
+}
+
+func TestCacheLoadSkipsExpired(t *testing.T) {
+	stub := &stubSolver{
+		cookies: []*http.Cookie{{Name: "cf_clearance", Value: "old"}},
+	}
+	c := NewCache(stub, 1*time.Millisecond)
+
+	now := time.Unix(1_000_000, 0)
+	c.nowFn = func() time.Time { return now }
+
+	target, _ := url.Parse("https://example.com/")
+	_, _ = c.LookupOrSolve(context.Background(), target, "1.2.3.4")
+
+	tmpDir := t.TempDir()
+	_ = c.SaveToDir(tmpDir)
+
+	// Advance clock past expiry.
+	c2 := NewCache(stub, 1*time.Millisecond)
+	c2.nowFn = func() time.Time { return now.Add(1 * time.Hour) }
+	loaded, _ := c2.LoadFromDir(tmpDir)
+	if loaded != 0 {
+		t.Errorf("expired entries should not be loaded, got %d", loaded)
+	}
+}
+
+func TestCookiesPreservedAcrossRotation(t *testing.T) {
+	// Simulate: solve on IP A, rotate to IP B, check IP A's cookies
+	// are still in the cache.
+	stub := &stubSolver{
+		cookies: []*http.Cookie{{Name: "cf_clearance", Value: "preserved"}},
+	}
+	c := NewCache(stub, 1*time.Hour)
+	target, _ := url.Parse("https://example.com/")
+
+	_, _ = c.LookupOrSolve(context.Background(), target, "1.2.3.4")
+	if c.Size() != 1 {
+		t.Fatal("expected 1 cached entry")
+	}
+
+	// Simulate rotation: DO NOT call InvalidateExit (new behavior).
+	// Old code would call c.InvalidateExit("1.2.3.4") here.
+	// Now we just snapshot the new IP and move on.
+
+	// Verify cookies are still accessible for the old IP.
+	sol := c.Lookup("example.com", "1.2.3.4")
+	if sol == nil {
+		t.Fatal("cookies should survive rotation")
+	}
+	if sol.Cookie("cf_clearance") != "preserved" {
+		t.Errorf("cf_clearance = %q, want preserved", sol.Cookie("cf_clearance"))
+	}
+
+	// A lookup for the NEW IP should miss (no cookies solved yet).
+	if c.Lookup("example.com", "5.6.7.8") != nil {
+		t.Error("new IP should not have cached cookies")
+	}
+}
+
+// --- circuit breaker ---
+
+func TestCircuitBreakerClosedInitially(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	if c.CircuitOpen("example.com") {
+		t.Error("fresh cache should have closed circuit for all hosts")
+	}
+}
+
+func TestCircuitBreakerOpensAfterThreshold(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(3, 10*time.Minute)
+
+	// First two failures don't open.
+	if opened := c.MarkRetryFailed("bad.host"); opened {
+		t.Error("failure 1 should not open circuit")
+	}
+	if c.CircuitOpen("bad.host") {
+		t.Error("circuit should still be closed after 1 failure")
+	}
+	if opened := c.MarkRetryFailed("bad.host"); opened {
+		t.Error("failure 2 should not open circuit")
+	}
+	if c.CircuitOpen("bad.host") {
+		t.Error("circuit should still be closed after 2 failures")
+	}
+	// Third failure opens.
+	if opened := c.MarkRetryFailed("bad.host"); !opened {
+		t.Error("failure 3 should open circuit")
+	}
+	if !c.CircuitOpen("bad.host") {
+		t.Error("circuit should be open after 3 failures")
+	}
+}
+
+func TestCircuitBreakerIsolatesHosts(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(2, 10*time.Minute)
+
+	c.MarkRetryFailed("bad.host")
+	c.MarkRetryFailed("bad.host")
+	if !c.CircuitOpen("bad.host") {
+		t.Error("bad.host should be open")
+	}
+	if c.CircuitOpen("good.host") {
+		t.Error("good.host should not be affected by bad.host's circuit")
+	}
+}
+
+func TestCircuitBreakerSuccessResets(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(3, 10*time.Minute)
+
+	c.MarkRetryFailed("flaky.host")
+	c.MarkRetryFailed("flaky.host")
+	// One away from opening.
+	c.MarkRetrySucceeded("flaky.host")
+	// Now three more failures should be needed to open again.
+	c.MarkRetryFailed("flaky.host")
+	c.MarkRetryFailed("flaky.host")
+	if c.CircuitOpen("flaky.host") {
+		t.Error("circuit should NOT be open after success reset + 2 new failures")
+	}
+	if opened := c.MarkRetryFailed("flaky.host"); !opened {
+		t.Error("third new failure after reset should open circuit")
+	}
+}
+
+func TestCircuitBreakerAutoCloses(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(2, 10*time.Minute)
+
+	// Inject fake clock.
+	now := time.Unix(1_000_000, 0)
+	c.nowFn = func() time.Time { return now }
+
+	c.MarkRetryFailed("pinned.host")
+	c.MarkRetryFailed("pinned.host")
+	if !c.CircuitOpen("pinned.host") {
+		t.Fatal("expected circuit open")
+	}
+
+	// Advance clock past open duration.
+	now = now.Add(11 * time.Minute)
+	if c.CircuitOpen("pinned.host") {
+		t.Error("circuit should auto-close after open duration elapses")
+	}
+
+	// The auto-close also resets the counter — one failure alone
+	// should not re-open.
+	c.MarkRetryFailed("pinned.host")
+	if c.CircuitOpen("pinned.host") {
+		t.Error("circuit should not reopen on first failure after auto-close")
+	}
+}
+
+func TestCircuitBreakerStatus(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(2, 10*time.Minute)
+
+	c.MarkRetryFailed("bad.host")
+	c.MarkRetryFailed("bad.host")
+	c.MarkRetryFailed("flaky.host")
+
+	status := c.CircuitStatus()
+	if len(status) != 2 {
+		t.Errorf("status has %d entries, want 2", len(status))
+	}
+	if !status["bad.host"].Open {
+		t.Error("bad.host should be Open=true")
+	}
+	if status["bad.host"].ConsecutiveFailures != 2 {
+		t.Errorf("bad.host failures = %d, want 2", status["bad.host"].ConsecutiveFailures)
+	}
+	if status["flaky.host"].Open {
+		t.Error("flaky.host should be Open=false")
+	}
+	if status["flaky.host"].ConsecutiveFailures != 1 {
+		t.Errorf("flaky.host failures = %d, want 1", status["flaky.host"].ConsecutiveFailures)
 	}
 }

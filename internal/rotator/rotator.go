@@ -485,7 +485,7 @@ func (r *Rotator) reapOnce() {
 	r.all = kept
 }
 
-// Stats returns observable counters for /healthz.
+// Stats returns observable counters for /.internal/healthz.
 func (r *Rotator) Stats() Stats {
 	s := Stats{
 		Rotations: r.rotations.Load(),
@@ -505,7 +505,7 @@ func (r *Rotator) Stats() Stats {
 	return s
 }
 
-// Stats is a snapshot of rotator state for admin/healthz.
+// Stats is a snapshot of rotator state for admin/.internal/healthz.
 type Stats struct {
 	CurrentIP     string
 	CurrentPub    string

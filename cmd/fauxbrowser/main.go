@@ -45,7 +45,7 @@ func run() error {
 
 	fs := flag.NewFlagSet("fauxbrowser", flag.ExitOnError)
 	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "plaintext h2c listen address")
-	fs.StringVar(&cfg.AdminListen, "admin-listen", cfg.AdminListen, "optional admin listener (/healthz, /rotate)")
+	fs.StringVar(&cfg.AdminListen, "admin-listen", cfg.AdminListen, "optional admin listener (GET /.internal/healthz, GET /.internal/solver, POST /.internal/rotate)")
 	fs.StringVar(&cfg.WGConf, "wg-conf", cfg.WGConf, "path to a wg-quick .conf (only PrivateKey + Address/DNS are used; peer is picked from the Proton catalog)")
 	fs.StringVar(&cfg.WGPrivateKey, "wg-private-key", cfg.WGPrivateKey, "base64 WireGuard private key (alternative to -wg-conf; gluetun-style)")
 	fs.StringVar(&cfg.VPNTier, "vpn-tier", cfg.VPNTier, "server tier: free (default), paid|plus, or all")
@@ -54,6 +54,7 @@ func run() error {
 	fs.DurationVar(&cfg.SolverTTL, "solver-ttl", cfg.SolverTTL, "how long to cache a solved (host, exit_ip) cookie bundle")
 	fs.DurationVar(&cfg.SolverTimeout, "solver-timeout", cfg.SolverTimeout, "max time per Chromium solve (startup + navigation + extract)")
 	fs.StringVar(&cfg.ChromiumPath, "chromium-path", cfg.ChromiumPath, "absolute Chromium binary path (default = $PATH lookup)")
+	fs.StringVar(&cfg.CookieStorePath, "cookie-store", cfg.CookieStorePath, "directory for persisting CF cookie cache — one file per (host, exitIP), survives restarts (empty = in-memory only)")
 	fs.BoolVar(&cfg.AllowVersionMismatch, "allow-version-mismatch", cfg.AllowVersionMismatch,
 		"start even if chromedp solver's Chromium has a Chrome major version that has no matching tls-client profile "+
 			"(or disagrees with an explicit -profile). Use when nixpkgs chromium just got bumped to N+1 and bogdanfinn/tls-client "+
@@ -193,12 +194,25 @@ func run() error {
 			Logf:          func(msg string, args ...any) { slog.Info(msg, args...) },
 		})
 		solverCache = solver.NewCache(ch, cfg.SolverTTL)
+		// Restore persisted cookies from a previous run and enable
+		// auto-persist for every future solve/invalidation.
+		if cfg.CookieStorePath != "" {
+			solverCache.SetStoreDir(cfg.CookieStorePath)
+			if n, err := solverCache.LoadFromDir(cfg.CookieStorePath); err != nil {
+				if !os.IsNotExist(err) {
+					slog.Warn("solver: could not load cookie store", "dir", cfg.CookieStorePath, "err", err)
+				}
+			} else if n > 0 {
+				slog.Info("solver: restored cookies from disk", "dir", cfg.CookieStorePath, "loaded", n)
+			}
+		}
 		slog.Info("WAF challenge solver enabled",
 			"solver", "chromedp",
 			"profile", profile.Name,
 			"chromium_major", chromiumMajor,
 			"ttl", cfg.SolverTTL.String(),
-			"timeout", cfg.SolverTimeout.String())
+			"timeout", cfg.SolverTimeout.String(),
+			"cookie_store", cfg.CookieStorePath)
 	}
 
 	var transport *proxy.Transport
@@ -219,31 +233,33 @@ func run() error {
 		MaxRetireAge:      cfg.MaxRetireAge,
 		ReaperInterval:    cfg.ReaperInterval,
 		OnRotate: func() {
-			// After the swap, clear our internal cookie jar so no
-			// Set-Cookie from the old IP can leak into a request sent
-			// via the new IP. Caller-set Cookie headers on incoming
-			// requests are untouched.
+			// After the swap, clear our internal tls-client cookie
+			// jar (Set-Cookie from upstream) so stale non-CF session
+			// cookies don't leak to the new IP. Caller-set Cookie
+			// headers on incoming requests are untouched.
 			if transport != nil {
 				if err := transport.RotateJar(); err != nil {
 					slog.Warn("rotator: jar rebuild failed", "err", err)
 				}
 			}
-			// Solver cache cookies are bound to the (UA, exit_ip)
-			// tuple — must drop everything for the OLD exit IP on
-			// rotation.
-			if solverCache != nil {
-				oldIP := *prevExitIP.Load()
-				if oldIP != "" {
-					dropped := solverCache.InvalidateExit(oldIP)
-					if dropped > 0 {
-						slog.Info("solver: cache invalidated for old exit IP",
-							"old_ip", oldIP, "dropped", dropped)
-					}
-				}
-			}
+			// Solver cache cookies (cf_clearance, _abck, etc.) are
+			// PRESERVED across rotations. They're keyed by (host,
+			// exitIP) — if the pool cycles back to the same IP
+			// later, the cached cookies are ready. Cookies are only
+			// invalidated when a CF-specific 403 rejects them
+			// (handled by transport's MarkRetryFailed + Invalidate).
+			//
 			// Snapshot the new exit IP for the next rotation event.
 			newIP := rot.Stats().CurrentIP
 			prevExitIP.Store(&newIP)
+
+			// Full sync to disk on rotation in case new entries
+			// were added since the last per-entry auto-persist.
+			if solverCache != nil && cfg.CookieStorePath != "" {
+				if err := solverCache.SaveToDir(cfg.CookieStorePath); err != nil {
+					slog.Warn("solver: disk sync failed", "err", err)
+				}
+			}
 		},
 		Logf: func(msg string, args ...any) { slog.Info(msg, args...) },
 	})
@@ -256,6 +272,8 @@ func run() error {
 	}
 	cancel()
 
+	stats := proxy.NewStatsTracker()
+
 	transport, err = proxy.NewTransport(proxy.TransportOptions{
 		Dialer:         rot.Dialer(),
 		TimeoutSeconds: cfg.TimeoutSecs,
@@ -263,6 +281,7 @@ func run() error {
 		Rotator:        rot,
 		SolverCache:    solverCache,
 		ExitIPProvider: func() string { return rot.Stats().CurrentIP },
+		Stats:          stats,
 	})
 	if err != nil {
 		return fmt.Errorf("build transport: %w", err)
@@ -300,7 +319,7 @@ func run() error {
 
 	var adminSrv *http.Server
 	if cfg.AdminListen != "" {
-		adminSrv = startAdmin(cfg.AdminListen, cfg.AdminToken, rot)
+		adminSrv = startAdmin(cfg.AdminListen, cfg.AdminToken, rot, solverCache, stats)
 	}
 
 	serverErr := make(chan error, 1)
@@ -325,16 +344,91 @@ func run() error {
 	if adminSrv != nil {
 		_ = adminSrv.Shutdown(shutdownCtx)
 	}
+	// Persist solver cookies on clean shutdown.
+	if solverCache != nil && cfg.CookieStorePath != "" {
+		if err := solverCache.SaveToDir(cfg.CookieStorePath); err != nil {
+			slog.Warn("solver: cookie store save on shutdown failed", "err", err)
+		} else {
+			slog.Info("solver: cookie store saved", "dir", cfg.CookieStorePath, "entries", solverCache.Size())
+		}
+	}
 	return nil
 }
 
-func startAdmin(addr, token string, rot *rotator.Rotator) *http.Server {
+// Admin endpoint path prefix. Leading-dot segments are illegal in
+// DNS hostnames and URL authority components, so no real upstream
+// target will ever have a path starting with /.internal/. This
+// gives admin endpoints a collision-free namespace even if an
+// operator mounts the admin mux on the same listener as the proxy
+// (not the default, but possible).
+const adminPrefix = "/.internal/"
+
+func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Cache, stats *proxy.StatsTracker) *http.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(adminPrefix+"healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(rot.Stats())
 	})
-	mux.HandleFunc("/rotate", func(w http.ResponseWriter, r *http.Request) {
+	// /.internal/solver exposes the per-host solver circuit-breaker
+	// state. Open circuits indicate hosts where repeated
+	// solve-then-retry still got challenged — likely WAF cookie
+	// pinning. Useful for debugging "why is my request failing"
+	// without reading server logs.
+	mux.HandleFunc(adminPrefix+"solver", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if solverCache == nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"enabled": false})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled":      true,
+			"cached_hosts": solverCache.Size(),
+			"circuits":     solverCache.CircuitStatus(),
+		})
+	})
+	// Per-host failure diagnostics. GET returns summary of all hosts
+	// sorted by failure rate. DELETE /.internal/stats/{host} resets
+	// a host's counters (manual override after fixing the cause).
+	mux.HandleFunc(adminPrefix+"stats/", func(w http.ResponseWriter, r *http.Request) {
+		host := strings.TrimPrefix(r.URL.Path, adminPrefix+"stats/")
+		if host == "" {
+			// GET /.internal/stats/ → summary of all hosts
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"hosts": stats.Summary(),
+			})
+			return
+		}
+		if r.Method == http.MethodDelete {
+			stats.ResetHost(host)
+			if solverCache != nil {
+				solverCache.MarkRetrySucceeded(host) // reset circuit breaker too
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		// GET /.internal/stats/{host} → detailed per-IP breakdown
+		detail := stats.HostDetail(host)
+		if detail == nil {
+			http.Error(w, "no stats for host", http.StatusNotFound)
+			return
+		}
+		diag, rec := stats.Diagnose(host)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"host":           detail,
+			"diagnosis":      diag,
+			"recommendation": rec,
+		})
+	})
+	mux.HandleFunc(adminPrefix+"stats", func(w http.ResponseWriter, r *http.Request) {
+		// Redirect /.internal/stats → /.internal/stats/
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"hosts": stats.Summary(),
+		})
+	})
+	mux.HandleFunc(adminPrefix+"rotate", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", http.StatusMethodNotAllowed)
 			return

@@ -132,3 +132,86 @@ func TestApplyProfileDefaultsPreservesCallerSoftHeaders(t *testing.T) {
 		t.Errorf("Sec-Fetch-Mode should have been set from softDefaults")
 	}
 }
+
+// TestChromeHeaderOrderMatchesCapture verifies the pinned header
+// order matches what was captured from real Chrome 146 via
+// tls.peet.ws/api/all on 2026-04-09. If Chrome bumps to a new
+// version with different header ordering, this test will need
+// updating alongside the profile.
+func TestChromeHeaderOrderMatchesCapture(t *testing.T) {
+	// Expected order captured from Chrome 146.0.7680.178 on macOS.
+	// The order is Chrome's internal decision — it comes from the
+	// browser's renderer attaching headers in a specific sequence.
+	want := []string{
+		"sec-ch-ua",
+		"sec-ch-ua-mobile",
+		"sec-ch-ua-platform",
+		"upgrade-insecure-requests",
+		"user-agent",
+		"accept-language",
+		"accept",
+		"sec-fetch-site",
+		"sec-fetch-mode",
+		"sec-fetch-user",
+		"sec-fetch-dest",
+		"accept-encoding",
+		"priority",
+		"cookie",
+	}
+	if len(chromeHeaderOrder) != len(want) {
+		t.Fatalf("chromeHeaderOrder has %d entries, want %d", len(chromeHeaderOrder), len(want))
+	}
+	for i, got := range chromeHeaderOrder {
+		if got != want[i] {
+			t.Errorf("chromeHeaderOrder[%d] = %q, want %q", i, got, want[i])
+		}
+	}
+}
+
+// TestSoftDefaultsIncludeAllChromeHeaders verifies every non-forced
+// header in the Chrome order has a soft default, so a bare request
+// with no caller-set headers still looks like a real Chrome
+// navigation.
+func TestSoftDefaultsIncludeAllChromeHeaders(t *testing.T) {
+	// These headers are forced (not soft defaults) or are set
+	// by the caller (cookie) — skip them in this check.
+	forced := map[string]bool{
+		"sec-ch-ua":          true,
+		"sec-ch-ua-mobile":   true,
+		"sec-ch-ua-platform": true,
+		"user-agent":         true,
+		"cookie":             true,
+	}
+	for _, h := range chromeHeaderOrder {
+		if forced[h] {
+			continue
+		}
+		if _, ok := softDefaults[canonicalSoftKey(h)]; !ok {
+			t.Errorf("chromeHeaderOrder includes %q but softDefaults has no entry for it", h)
+		}
+	}
+}
+
+// canonicalSoftKey converts a lowercase header name to the
+// canonical form used as a key in softDefaults (Title-Case).
+func canonicalSoftKey(lower string) string {
+	// softDefaults keys are in http.CanonicalHeaderKey format.
+	// We need to match them from the lowercase chromeHeaderOrder.
+	for k := range softDefaults {
+		if strings.EqualFold(k, lower) {
+			return k
+		}
+	}
+	return lower
+}
+
+// TestPriorityHeaderInSoftDefaults verifies Chrome 146's Priority
+// header is present as a soft default — Chrome sends "u=0, i" on
+// every document navigation.
+func TestPriorityHeaderInSoftDefaults(t *testing.T) {
+	if v, ok := softDefaults["Priority"]; !ok {
+		t.Error("Priority missing from softDefaults")
+	} else if v != "u=0, i" {
+		t.Errorf("Priority = %q, want %q", v, "u=0, i")
+	}
+}

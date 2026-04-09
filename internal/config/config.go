@@ -45,6 +45,13 @@ type Config struct {
 	SolverTimeout  time.Duration // per-solve browser deadline (default 30s)
 	ChromiumPath   string        // override Chromium binary path (default = $PATH lookup)
 
+	// CookieStorePath is an optional file path for persisting the
+	// solver's CF cookie cache to disk. When set, the cache is
+	// loaded on startup and saved on each VPN rotation + shutdown.
+	// Cookies survive process restarts, so solved CF sessions can
+	// be reused across deploys without re-solving.
+	CookieStorePath string
+
 	// AllowVersionMismatch permits fauxbrowser to start when the
 	// chromedp solver's Chromium binary has a Chrome major version
 	// that disagrees with the active tls-client profile (or has no
@@ -145,6 +152,9 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("FAUXBROWSER_CHROMIUM_PATH"); v != "" {
 		c.ChromiumPath = v
+	}
+	if v := os.Getenv("FAUXBROWSER_COOKIE_STORE"); v != "" {
+		c.CookieStorePath = v
 	}
 	if v := strings.ToLower(os.Getenv("FAUXBROWSER_ALLOW_VERSION_MISMATCH")); v != "" {
 		switch v {
