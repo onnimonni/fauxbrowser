@@ -11,43 +11,55 @@ import (
 type Config struct {
 	Listen       string
 	AdminListen  string
-	Upstream     string
-	Profile      string
-	CACertPath   string
-	CAKeyPath    string
-	CAOut        string
 	TargetHeader string
-	ProfileHdr   string
-	SessionHdr   string
-	TimeoutSecs  int
-	Auth         string   // "user:pass" for Proxy-Authorization Basic
-	AllowHosts   []string // glob list; empty = allow all
-	AllowOpen    bool     // allow non-loopback listen without auth
-	LeafCacheMax int
-	SessionMax   int
-	Insecure     bool // skip TLS verify on upstream (tests only)
-	LogLevel     string
 
-	Solver       string        // "", "flaresolverr"
-	SolverURL    string        // e.g. http://127.0.0.1:8191
-	SolverEgress string        // proxy URL the solver should use as ITS egress
-	SolverTTL    time.Duration // cache lifetime for solved cookies
+	// Bearer tokens for the proxy and admin listeners. Empty = disabled
+	// (which is only permitted on loopback; see main.safetyCheck).
+	AuthToken  string
+	AdminToken string
 
-	WGConf string // path to a wg-quick style .conf file; enables embedded tunnel
+	// WireGuard base conf: private key, interface address, DNS, MTU.
+	// Peer fields are ignored — the rotator supplies them from the
+	// Proton catalog.
+	WGConf string
+
+	// Proton server filter.
+	VPNTier       string   // "free" (default), "paid"/"plus", "all"
+	VPNCountries  []string // ISO alpha-2
+	VPNContinents []string // EU, NA, AS, ...
+
+	// Browser profile used for TLS fingerprint + header bundle.
+	// Empty or "latest" = chrome146 (the current default). Known
+	// values: chrome146, chrome144, chrome133, chrome131.
+	Profile string
+
+	TimeoutSecs   int
+	CooldownSecs  int           // taint cooldown per server after 429/403
+	HandshakeWait time.Duration // handshake observation window per rotation attempt
+
+	// Blue/green rotator tuning.
+	MinHostRotation   time.Duration // per-host debounce window
+	GlobalMinInterval time.Duration // global backstop between rotations
+	MaxRetireAge      time.Duration // force-close retired tunnels past this age
+	ReaperInterval    time.Duration // how often the reaper scans
+
+	LogLevel string
 }
 
 func Default() *Config {
 	return &Config{
-		Listen:       "127.0.0.1:18443",
-		Profile:      "chrome146",
-		TargetHeader: "X-Target-URL",
-		ProfileHdr:   "X-Fauxbrowser-Profile",
-		SessionHdr:   "X-Fauxbrowser-Session",
-		TimeoutSecs:  60,
-		LeafCacheMax: 1024,
-		SessionMax:   256,
-		LogLevel:     "info",
-		SolverTTL:    25 * time.Minute,
+		Listen:        "127.0.0.1:18443",
+		TargetHeader:  "X-Target-URL",
+		VPNTier:       "free",
+		Profile:       "chrome146",
+		TimeoutSecs:   60,
+		CooldownSecs:      900, // 15 min
+		HandshakeWait:     6 * time.Second,
+		MinHostRotation:   5 * time.Minute,
+		GlobalMinInterval: 2 * time.Second,
+		MaxRetireAge:      2 * time.Minute,
+		ReaperInterval:    5 * time.Second,
+		LogLevel:          "info",
 	}
 }
 
@@ -60,54 +72,39 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("FAUXBROWSER_ADMIN_LISTEN"); v != "" {
 		c.AdminListen = v
 	}
-	if v := os.Getenv("FAUXBROWSER_UPSTREAM"); v != "" {
-		c.Upstream = v
+	if v := os.Getenv("FAUXBROWSER_AUTH_TOKEN"); v != "" {
+		c.AuthToken = v
+	}
+	if v := os.Getenv("FAUXBROWSER_ADMIN_TOKEN"); v != "" {
+		c.AdminToken = v
+	}
+	if v := os.Getenv("FAUXBROWSER_WG_CONF"); v != "" {
+		c.WGConf = v
+	}
+	if v := os.Getenv("FAUXBROWSER_VPN_TIER"); v != "" {
+		c.VPNTier = v
 	}
 	if v := os.Getenv("FAUXBROWSER_PROFILE"); v != "" {
 		c.Profile = v
 	}
-	if v := os.Getenv("FAUXBROWSER_CA_CERT"); v != "" {
-		c.CACertPath = v
+	if v := os.Getenv("FAUXBROWSER_VPN_COUNTRIES"); v != "" {
+		c.VPNCountries = SplitCSV(v)
 	}
-	if v := os.Getenv("FAUXBROWSER_CA_KEY"); v != "" {
-		c.CAKeyPath = v
-	}
-	if v := os.Getenv("FAUXBROWSER_CA_OUT"); v != "" {
-		c.CAOut = v
-	}
-	if v := os.Getenv("FAUXBROWSER_AUTH"); v != "" {
-		c.Auth = v
-	}
-	if v := os.Getenv("FAUXBROWSER_ALLOW_HOSTS"); v != "" {
-		c.AllowHosts = SplitCSV(v)
-	}
-	if v := os.Getenv("FAUXBROWSER_ALLOW_OPEN"); v == "1" || v == "true" {
-		c.AllowOpen = true
+	if v := os.Getenv("FAUXBROWSER_VPN_CONTINENTS"); v != "" {
+		c.VPNContinents = SplitCSV(v)
 	}
 	if v := os.Getenv("FAUXBROWSER_TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.TimeoutSecs = n
 		}
 	}
+	if v := os.Getenv("FAUXBROWSER_COOLDOWN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.CooldownSecs = n
+		}
+	}
 	if v := os.Getenv("FAUXBROWSER_LOG_LEVEL"); v != "" {
 		c.LogLevel = v
-	}
-	if v := os.Getenv("FAUXBROWSER_WG_CONF"); v != "" {
-		c.WGConf = v
-	}
-	if v := os.Getenv("FAUXBROWSER_SOLVER"); v != "" {
-		c.Solver = v
-	}
-	if v := os.Getenv("FAUXBROWSER_SOLVER_URL"); v != "" {
-		c.SolverURL = v
-	}
-	if v := os.Getenv("FAUXBROWSER_SOLVER_EGRESS"); v != "" {
-		c.SolverEgress = v
-	}
-	if v := os.Getenv("FAUXBROWSER_SOLVER_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			c.SolverTTL = d
-		}
 	}
 }
 

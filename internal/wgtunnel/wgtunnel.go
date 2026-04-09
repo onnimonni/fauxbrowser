@@ -1,13 +1,16 @@
 // Package wgtunnel embeds a userspace WireGuard tunnel (wireguard-go +
-// gVisor netstack) inside fauxbrowser so a single binary can egress via
-// WireGuard without a gluetun sidecar, /dev/net/tun, or NET_ADMIN.
+// gVisor netstack) so a single binary can egress via WireGuard without
+// a gluetun sidecar, /dev/net/tun, or NET_ADMIN.
 //
 // The tunnel exposes a proxy.ContextDialer whose connections go through
 // the WG peer. Hand that dialer to tls-client (via WithProxyDialerFactory)
 // and every upstream fetch silently uses the VPN without any other
-// plumbing. If nothing else in the binary uses any other Dialer, there
-// is no bare-metal IP leak path — the kill switch is architectural
-// rather than firewall-based.
+// plumbing.
+//
+// Peer pinning: the WireGuard handshake is itself a proof that the
+// server on the other end holds the expected private key, so setting
+// PeerPublicKey is peer pinning. There is no auxiliary verification
+// needed — a wrong pubkey simply produces no handshake response.
 package wgtunnel
 
 import (
@@ -21,6 +24,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/net/proxy"
 	"golang.zx2c4.com/wireguard/conn"
@@ -30,12 +34,12 @@ import (
 
 // Config describes the subset of a WireGuard .conf fauxbrowser needs.
 type Config struct {
-	PrivateKey        []byte     // 32-byte raw key
+	PrivateKey        []byte // 32-byte raw key
 	Addresses         []netip.Addr
 	DNS               []netip.Addr
 	MTU               int
-	PeerPublicKey     []byte     // 32-byte raw key
-	PeerPresharedKey  []byte     // 32-byte raw key, optional
+	PeerPublicKey     []byte // 32-byte raw key
+	PeerPresharedKey  []byte // 32-byte raw key, optional
 	EndpointHost      string
 	EndpointPort      int
 	PersistentKeepAlv int // seconds, 0 = disabled
@@ -50,7 +54,6 @@ type Tunnel struct {
 
 // LoadConfig parses a WireGuard-style .conf file. Supports only the
 // [Interface] + first [Peer] sections; extra peers are ignored.
-// Not a full wg-quick parser — intentionally minimal.
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -77,21 +80,19 @@ func parseConfig(text string) (*Config, error) {
 		}
 		key := strings.ToLower(strings.TrimSpace(line[:eq]))
 		val := strings.TrimSpace(line[eq+1:])
-
 		switch section {
 		case "interface":
 			switch key {
 			case "privatekey":
 				b, err := base64.StdEncoding.DecodeString(val)
 				if err != nil || len(b) != 32 {
-					return nil, fmt.Errorf("bad PrivateKey")
+					return nil, errors.New("bad PrivateKey")
 				}
 				cfg.PrivateKey = b
 			case "address":
 				for _, a := range splitCSV(val) {
 					ap, err := netip.ParsePrefix(a)
 					if err != nil {
-						// also accept bare addrs
 						if ip, err2 := netip.ParseAddr(a); err2 == nil {
 							cfg.Addresses = append(cfg.Addresses, ip)
 							continue
@@ -120,7 +121,7 @@ func parseConfig(text string) (*Config, error) {
 			case "publickey":
 				b, err := base64.StdEncoding.DecodeString(val)
 				if err != nil || len(b) != 32 {
-					return nil, fmt.Errorf("bad PublicKey")
+					return nil, errors.New("bad PublicKey")
 				}
 				cfg.PeerPublicKey = b
 			case "presharedkey":
@@ -129,7 +130,7 @@ func parseConfig(text string) (*Config, error) {
 				}
 				b, err := base64.StdEncoding.DecodeString(val)
 				if err != nil || len(b) != 32 {
-					return nil, fmt.Errorf("bad PresharedKey")
+					return nil, errors.New("bad PresharedKey")
 				}
 				cfg.PeerPresharedKey = b
 			case "endpoint":
@@ -141,9 +142,6 @@ func parseConfig(text string) (*Config, error) {
 				if err != nil {
 					return nil, fmt.Errorf("bad Endpoint port %q: %w", portStr, err)
 				}
-				// Endpoint may be a hostname — resolve on the host network
-				// (this is intentional: we can't resolve it inside the tunnel
-				// before the tunnel is up).
 				if ip := net.ParseIP(host); ip != nil {
 					cfg.EndpointHost = host
 				} else {
@@ -176,8 +174,7 @@ func parseConfig(text string) (*Config, error) {
 		return nil, errors.New("Interface Address missing")
 	}
 	if len(cfg.DNS) == 0 {
-		// Sensible fallback; user should set it.
-		cfg.DNS = []netip.Addr{netip.MustParseAddr("1.1.1.1")}
+		cfg.DNS = []netip.Addr{netip.MustParseAddr("10.2.0.1")}
 	}
 	return cfg, nil
 }
@@ -194,6 +191,34 @@ func splitCSV(s string) []string {
 	return out
 }
 
+// WithPeer returns a copy of c with a new peer public key and endpoint,
+// preserving everything else (notably the private key and interface
+// address). Used by the rotator to swap exits without rebuilding
+// interface state from scratch.
+func (c *Config) WithPeer(peerPubkeyBase64, endpointIP string, port int) (*Config, error) {
+	pub, err := base64.StdEncoding.DecodeString(peerPubkeyBase64)
+	if err != nil || len(pub) != 32 {
+		return nil, fmt.Errorf("bad peer public key %q", peerPubkeyBase64)
+	}
+	if net.ParseIP(endpointIP) == nil {
+		return nil, fmt.Errorf("peer endpoint %q is not a literal IP (must be resolved before this call)", endpointIP)
+	}
+	if port <= 0 {
+		port = 51820
+	}
+	cp := *c
+	cp.PeerPublicKey = pub
+	cp.PeerPresharedKey = nil
+	cp.EndpointHost = endpointIP
+	cp.EndpointPort = port
+	return &cp, nil
+}
+
+// PeerPublicKeyBase64 returns the current peer public key, base64-encoded.
+func (c *Config) PeerPublicKeyBase64() string {
+	return base64.StdEncoding.EncodeToString(c.PeerPublicKey)
+}
+
 // Start brings up a userspace WireGuard tunnel for the given config and
 // returns a live Tunnel.
 func Start(cfg *Config, logf func(format string, args ...any)) (*Tunnel, error) {
@@ -201,7 +226,6 @@ func Start(cfg *Config, logf func(format string, args ...any)) (*Tunnel, error) 
 	if err != nil {
 		return nil, fmt.Errorf("create netstack TUN: %w", err)
 	}
-	lvl := device.LogLevelError
 	if logf == nil {
 		logf = func(format string, args ...any) {}
 	}
@@ -209,9 +233,6 @@ func Start(cfg *Config, logf func(format string, args ...any)) (*Tunnel, error) 
 		Verbosef: func(format string, args ...any) { logf("wg: "+format, args...) },
 		Errorf:   func(format string, args ...any) { logf("wg: "+format, args...) },
 	})
-	_ = lvl
-
-	// Build the wg IpcSet script. Keys must be hex-encoded.
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "private_key=%s\n", hex.EncodeToString(cfg.PrivateKey))
 	fmt.Fprintf(&sb, "public_key=%s\n", hex.EncodeToString(cfg.PeerPublicKey))
@@ -219,19 +240,50 @@ func Start(cfg *Config, logf func(format string, args ...any)) (*Tunnel, error) 
 		fmt.Fprintf(&sb, "preshared_key=%s\n", hex.EncodeToString(cfg.PeerPresharedKey))
 	}
 	fmt.Fprintf(&sb, "endpoint=%s:%d\n", cfg.EndpointHost, cfg.EndpointPort)
-	// Route everything through the tunnel.
 	fmt.Fprintf(&sb, "allowed_ip=0.0.0.0/0\n")
 	fmt.Fprintf(&sb, "allowed_ip=::/0\n")
 	if cfg.PersistentKeepAlv > 0 {
 		fmt.Fprintf(&sb, "persistent_keepalive_interval=%d\n", cfg.PersistentKeepAlv)
 	}
 	if err := dev.IpcSet(sb.String()); err != nil {
+		dev.Close()
 		return nil, fmt.Errorf("wg IpcSet: %w", err)
 	}
 	if err := dev.Up(); err != nil {
+		dev.Close()
 		return nil, fmt.Errorf("wg device up: %w", err)
 	}
 	return &Tunnel{device: dev, net: tnet, cfg: cfg}, nil
+}
+
+// WaitHandshake polls the device IPC until the peer reports a recent
+// handshake, or the deadline expires. Returns nil on success. Used by
+// the rotator to distinguish a "peer accepted our pubkey" success from
+// a silent failure (wrong pinned pubkey = no response forever).
+func (t *Tunnel) WaitHandshake(ctx context.Context, deadline time.Duration) error {
+	d, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	tick := time.NewTicker(150 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-d.Done():
+			return fmt.Errorf("wg handshake not observed within %s", deadline)
+		case <-tick.C:
+			ipc, err := t.device.IpcGet()
+			if err != nil {
+				continue
+			}
+			// Look for a non-zero last_handshake_time_sec line.
+			for _, line := range strings.Split(ipc, "\n") {
+				if strings.HasPrefix(line, "last_handshake_time_sec=") {
+					if strings.TrimPrefix(line, "last_handshake_time_sec=") != "0" {
+						return nil
+					}
+				}
+			}
+		}
+	}
 }
 
 // Close tears down the tunnel.
@@ -239,6 +291,9 @@ func (t *Tunnel) Close() error {
 	t.device.Close()
 	return nil
 }
+
+// Config returns the tunnel's live config.
+func (t *Tunnel) Config() *Config { return t.cfg }
 
 // ContextDialer returns a proxy.ContextDialer whose connections egress
 // via the WireGuard tunnel.

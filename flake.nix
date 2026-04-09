@@ -1,5 +1,5 @@
 {
-  description = "fauxbrowser — TLS fingerprint forging HTTP proxy";
+  description = "fauxbrowser — ProtonVPN WireGuard + TLS fingerprint forging HTTP proxy for crawlers";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -7,23 +7,44 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs { inherit system; };
-        fauxbrowser = pkgs.buildGoModule {
-          pname = "fauxbrowser";
-          version = "0.4.0";
-          src = ./.;
-          vendorHash = "sha256-n02zSPn/NJADb92FBhFALuoY5xLlW8O9LBKYisFg9Z0=";
-          subPackages = [ "cmd/fauxbrowser" ];
-          doCheck = true;
-          meta = with pkgs.lib; {
-            description = "TLS fingerprint forging HTTP proxy (uses bogdanfinn/tls-client)";
-            license = licenses.mit;
-            mainProgram = "fauxbrowser";
-            platforms = platforms.unix;
-          };
+    let
+      # Go build output. Called per-system below.
+      mkFauxbrowser = pkgs: pkgs.buildGoModule rec {
+        pname = "fauxbrowser";
+        version = "0.5.0";
+        src = ./.;
+        vendorHash = "sha256-sLh2+zcN1Dr6XJgB7xCOEINz4SK8Az9WZP8nYk2hh4Q=";
+        subPackages = [ "cmd/fauxbrowser" ];
+        ldflags = [
+          "-s"
+          "-w"
+          "-X=main.version=${version}"
+        ];
+        # Tests run out-of-band via `go test -race ./...` (see CI).
+        # Including them in the Nix build path eats multiple gigabytes
+        # of /tmp for the race detector's metadata and is redundant
+        # with the regular test suite anyway.
+        doCheck = false;
+        meta = with pkgs.lib; {
+          description = "ProtonVPN WireGuard + chrome146 TLS fingerprint forging HTTP proxy for crawlers";
+          homepage = "https://github.com/onnimonni/fauxbrowser";
+          license = licenses.mit;
+          mainProgram = "fauxbrowser";
+          platforms = platforms.unix;
+          maintainers = [ { name = "Onni Hakala"; github = "onnimonni"; } ];
         };
+      };
+
+      # Overlay so `pkgs.fauxbrowser` resolves to the flake's build
+      # inside nixosModules.default.
+      overlay = final: prev: {
+        fauxbrowser = mkFauxbrowser final;
+      };
+    in
+    (flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs { inherit system; overlays = [ overlay ]; };
+        fauxbrowser = pkgs.fauxbrowser;
       in {
         packages.default = fauxbrowser;
         packages.fauxbrowser = fauxbrowser;
@@ -36,7 +57,15 @@
         checks.default = fauxbrowser;
 
         devShells.default = pkgs.mkShell {
-          packages = [ pkgs.go pkgs.gopls pkgs.curl ];
+          packages = with pkgs; [ go gopls curl jq ];
         };
-      });
+      })) // {
+        # System-independent outputs.
+        overlays.default = overlay;
+
+        nixosModules.default = { config, pkgs, lib, ... }: {
+          imports = [ ./nix/module.nix ];
+          nixpkgs.overlays = [ overlay ];
+        };
+      };
 }

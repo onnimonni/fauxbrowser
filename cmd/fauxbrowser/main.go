@@ -1,8 +1,12 @@
-// fauxbrowser — TLS fingerprint forging HTTP proxy.
+// fauxbrowser — single-binary HTTP proxy that forwards to targets over
+// an embedded ProtonVPN free-tier WireGuard tunnel, forges a chrome146
+// TLS fingerprint on the way out, and rotates the exit IP when the
+// downstream target rate-limits or WAF-challenges us.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,11 +19,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/onnimonni/fauxbrowser/internal/ca"
 	"github.com/onnimonni/fauxbrowser/internal/config"
+	"github.com/onnimonni/fauxbrowser/internal/proton"
 	"github.com/onnimonni/fauxbrowser/internal/proxy"
-	"github.com/onnimonni/fauxbrowser/internal/solver"
-	"github.com/onnimonni/fauxbrowser/internal/solver/flaresolverr"
+	"github.com/onnimonni/fauxbrowser/internal/rotator"
 	"github.com/onnimonni/fauxbrowser/internal/wgtunnel"
 )
 
@@ -38,28 +41,25 @@ func run() error {
 	cfg.LoadEnv()
 
 	fs := flag.NewFlagSet("fauxbrowser", flag.ExitOnError)
-	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "address to listen on (e.g. 127.0.0.1:18443)")
-	fs.StringVar(&cfg.AdminListen, "admin-listen", cfg.AdminListen, "optional admin listener for /healthz (empty = disabled)")
-	fs.StringVar(&cfg.Upstream, "upstream", cfg.Upstream, "upstream HTTP proxy URL (empty = direct)")
-	fs.StringVar(&cfg.Profile, "profile", cfg.Profile, "default browser profile (e.g. chrome146)")
-	fs.StringVar(&cfg.CACertPath, "ca-cert", cfg.CACertPath, "path to existing CA cert PEM")
-	fs.StringVar(&cfg.CAKeyPath, "ca-key", cfg.CAKeyPath, "path to existing CA private key PEM")
-	fs.StringVar(&cfg.CAOut, "ca-out", cfg.CAOut, "persist auto-generated CA to basename.pem + .key")
-	fs.StringVar(&cfg.TargetHeader, "target-header", cfg.TargetHeader, "header name carrying the target URL in header mode")
+	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "plaintext h2c listen address")
+	fs.StringVar(&cfg.AdminListen, "admin-listen", cfg.AdminListen, "optional admin listener (/healthz, /rotate)")
+	fs.StringVar(&cfg.WGConf, "wg-conf", cfg.WGConf, "path to a wg-quick .conf (only PrivateKey + Address/DNS are used; peer is picked from the Proton catalog)")
+	fs.StringVar(&cfg.VPNTier, "vpn-tier", cfg.VPNTier, "server tier: free (default), paid|plus, or all")
+	fs.StringVar(&cfg.Profile, "profile", cfg.Profile, "browser profile: chrome146 (default), chrome144, chrome133, chrome131, or 'latest'")
+	var countriesFlag string
+	fs.StringVar(&countriesFlag, "vpn-country", strings.Join(cfg.VPNCountries, ","), "comma-separated ISO country allow-list (e.g. NL,DE)")
+	var continentsFlag string
+	fs.StringVar(&continentsFlag, "vpn-continent", strings.Join(cfg.VPNContinents, ","), "comma-separated continent allow-list (EU,NA,AS,OC,SA,AF)")
 	fs.IntVar(&cfg.TimeoutSecs, "timeout", cfg.TimeoutSecs, "per-request upstream timeout seconds")
-	fs.StringVar(&cfg.Auth, "auth", cfg.Auth, "Proxy-Authorization Basic user:pass (required for non-loopback without -allow-open)")
-	var allowHostsFlag string
-	fs.StringVar(&allowHostsFlag, "allow-hosts", strings.Join(cfg.AllowHosts, ","), "comma-separated host glob allow-list")
-	fs.BoolVar(&cfg.AllowOpen, "allow-open", cfg.AllowOpen, "allow non-loopback listen without auth (dangerous)")
-	fs.IntVar(&cfg.LeafCacheMax, "leaf-cache-max", cfg.LeafCacheMax, "max cached MITM leaf certs")
-	fs.IntVar(&cfg.SessionMax, "session-max", cfg.SessionMax, "max concurrent tls-client sessions in pool")
-	fs.BoolVar(&cfg.Insecure, "insecure", cfg.Insecure, "skip upstream TLS verification (tests only)")
+	fs.IntVar(&cfg.CooldownSecs, "cooldown", cfg.CooldownSecs, "taint cooldown for a burned exit IP, seconds")
+	fs.DurationVar(&cfg.HandshakeWait, "handshake-wait", cfg.HandshakeWait, "max time to wait for a WireGuard handshake per rotation attempt")
+	fs.DurationVar(&cfg.MinHostRotation, "host-debounce", cfg.MinHostRotation, "per-host rotation debounce (second 429 on the same host within this window → no re-rotation, upstream status passes through)")
+	fs.DurationVar(&cfg.GlobalMinInterval, "rotation-min-interval", cfg.GlobalMinInterval, "global minimum interval between any two rotations")
+	fs.DurationVar(&cfg.MaxRetireAge, "retire-max-age", cfg.MaxRetireAge, "force-close retired tunnels with in-flight > 0 after this age")
+	fs.DurationVar(&cfg.ReaperInterval, "reaper-interval", cfg.ReaperInterval, "how often the reaper scans for drained tunnels")
+	fs.StringVar(&cfg.AuthToken, "auth-token", cfg.AuthToken, "bearer token required on the proxy listener (mandatory on non-loopback binds)")
+	fs.StringVar(&cfg.AdminToken, "admin-token", cfg.AdminToken, "bearer token required on the admin listener (mandatory on non-loopback binds)")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "debug|info|warn|error")
-	fs.StringVar(&cfg.WGConf, "wg-conf", cfg.WGConf, "path to a WireGuard .conf file. When set, fauxbrowser embeds a userspace WireGuard tunnel and egresses via it (no external gluetun needed). Overrides -upstream.")
-	fs.StringVar(&cfg.Solver, "solver", cfg.Solver, "challenge solver: flaresolverr (empty = disabled)")
-	fs.StringVar(&cfg.SolverURL, "solver-url", cfg.SolverURL, "URL of the challenge solver backend (e.g. http://127.0.0.1:8191)")
-	fs.StringVar(&cfg.SolverEgress, "solver-egress", cfg.SolverEgress, "HTTP proxy URL the solver should egress through (defaults to -upstream). Must be reachable from the solver container.")
-	fs.DurationVar(&cfg.SolverTTL, "solver-ttl", cfg.SolverTTL, "how long to reuse a solved cookie bundle per (session, domain)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	_ = fs.Parse(os.Args[1:])
 
@@ -67,99 +67,104 @@ func run() error {
 		fmt.Println("fauxbrowser", version)
 		return nil
 	}
-
-	if allowHostsFlag != "" {
-		cfg.AllowHosts = config.SplitCSV(allowHostsFlag)
+	if countriesFlag != "" {
+		cfg.VPNCountries = config.SplitCSV(countriesFlag)
+	}
+	if continentsFlag != "" {
+		cfg.VPNContinents = config.SplitCSV(continentsFlag)
 	}
 
 	setupLogger(cfg.LogLevel)
 
-	// Safety: refuse to bind non-loopback without auth unless -allow-open.
 	if err := safetyCheck(cfg); err != nil {
 		return err
 	}
 
-	// CA bootstrap.
-	pair, err := bootstrapCA(cfg)
+	if cfg.WGConf == "" {
+		return errors.New("-wg-conf is required (path to a Proton .conf with PrivateKey + Address/DNS)")
+	}
+	baseCfg, err := wgtunnel.LoadConfig(cfg.WGConf)
 	if err != nil {
-		return err
+		return fmt.Errorf("load wg conf: %w", err)
 	}
-	leafCache := ca.NewLeafCache(pair, cfg.LeafCacheMax)
+	// The base conf's peer fields are DISCARDED — rotator picks peers
+	// from the Proton catalog. Wipe them to make that invariant loud.
+	baseCfg.PeerPublicKey = nil
+	baseCfg.PeerPresharedKey = nil
+	baseCfg.EndpointHost = ""
+	baseCfg.EndpointPort = 0
 
-	// Optional embedded WireGuard tunnel (userspace, no NET_ADMIN needed).
-	var wgTun *wgtunnel.Tunnel
-	if cfg.WGConf != "" {
-		wcfg, err := wgtunnel.LoadConfig(cfg.WGConf)
-		if err != nil {
-			return fmt.Errorf("load wg conf: %w", err)
-		}
-		slog.Info("bringing up embedded WireGuard tunnel",
-			"conf", cfg.WGConf,
-			"endpoint", fmt.Sprintf("%s:%d", wcfg.EndpointHost, wcfg.EndpointPort),
-			"addresses", wcfg.Addresses,
-		)
-		wgTun, err = wgtunnel.Start(wcfg, func(f string, a ...any) {
-			slog.Debug(fmt.Sprintf(f, a...))
-		})
-		if err != nil {
-			return fmt.Errorf("start wg tunnel: %w", err)
-		}
-		defer wgTun.Close()
-		if cfg.Upstream != "" {
-			slog.Warn("ignoring -upstream because -wg-conf is set", "upstream", cfg.Upstream)
-			cfg.Upstream = ""
-		}
+	catalog, err := proton.Embedded()
+	if err != nil {
+		return fmt.Errorf("load proton catalog: %w", err)
 	}
-
-	// Optional WAF challenge solver.
-	var solverCache *solver.Cache
-	switch strings.ToLower(cfg.Solver) {
-	case "":
-		// disabled
-	case "flaresolverr":
-		if cfg.SolverURL == "" {
-			return fmt.Errorf("-solver flaresolverr requires -solver-url")
-		}
-		fs := flaresolverr.New(cfg.SolverURL)
-		solverCache = solver.NewCache(fs, cfg.SolverTTL)
-		slog.Info("challenge solver enabled", "solver", "flaresolverr", "url", cfg.SolverURL)
-	default:
-		return fmt.Errorf("unknown -solver %q", cfg.Solver)
+	tierFilter := proton.ParseTierFilter(cfg.VPNTier)
+	servers := catalog.Filter(tierFilter, cfg.VPNCountries, cfg.VPNContinents)
+	if len(servers) == 0 {
+		return fmt.Errorf("no Proton servers match tier=%s countries=%v continents=%v",
+			cfg.VPNTier, cfg.VPNCountries, cfg.VPNContinents)
 	}
+	slog.Info("proton catalog loaded",
+		"total", catalog.Len(),
+		"filtered", len(servers),
+		"tier", cfg.VPNTier,
+		"countries", cfg.VPNCountries,
+		"continents", cfg.VPNContinents,
+		"snapshot", catalog.FetchedAt())
 
-	// Transport (tls-client pool).
-	transportOpts := proxy.TransportOptions{
-		DefaultProfile: cfg.Profile,
-		UpstreamProxy:  cfg.Upstream,
+	pool := proton.NewPool(servers, int64(cfg.CooldownSecs), nil)
+
+	var transport *proxy.Transport
+	rot := rotator.New(rotator.Options{
+		BaseConfig:        baseCfg,
+		Catalog:           catalog,
+		Pool:              pool,
+		HandshakeTimeout:  cfg.HandshakeWait,
+		MinHostRotation:   cfg.MinHostRotation,
+		GlobalMinInterval: cfg.GlobalMinInterval,
+		MaxRetireAge:      cfg.MaxRetireAge,
+		ReaperInterval:    cfg.ReaperInterval,
+		OnRotate: func() {
+			// After the swap, clear our internal cookie jar so no
+			// Set-Cookie from the old IP can leak into a request sent
+			// via the new IP. Caller-set Cookie headers on incoming
+			// requests are untouched.
+			if transport != nil {
+				if err := transport.RotateJar(); err != nil {
+					slog.Warn("rotator: jar rebuild failed", "err", err)
+				}
+			}
+		},
+		Logf: func(msg string, args ...any) { slog.Info(msg, args...) },
+	})
+	defer rot.Close()
+
+	bootstrapCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	if err := rot.Bootstrap(bootstrapCtx); err != nil {
+		cancel()
+		return fmt.Errorf("bring up initial tunnel: %w", err)
+	}
+	cancel()
+
+	transport, err = proxy.NewTransport(proxy.TransportOptions{
+		Dialer:         rot.Dialer(),
 		TimeoutSeconds: cfg.TimeoutSecs,
-		Insecure:       cfg.Insecure,
-		ProfileHeader:  cfg.ProfileHdr,
-		SessionHeader:  cfg.SessionHdr,
-		MaxSessions:    cfg.SessionMax,
-		SolverCache:    solverCache,
-		SolverEgress:   cfg.SolverEgress,
+		Profile:        cfg.Profile,
+		Rotator:        rot,
+	})
+	if err != nil {
+		return fmt.Errorf("build transport: %w", err)
 	}
-	if wgTun != nil {
-		transportOpts.CustomDialer = wgTun.ContextDialer()
-	}
-	transport := proxy.NewTransport(transportOpts)
 	defer transport.Close()
 
-	mitm := proxy.NewMITM(leafCache, transport)
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = mitm.Shutdown(ctx)
-	}()
-
-	handler := proxy.NewHandler(proxy.Options{
-		ListenAddr:   cfg.Listen,
+	base := proxy.NewHandler(proxy.Options{
 		TargetHeader: cfg.TargetHeader,
 		Transport:    transport,
-		MITM:         mitm,
 	})
-	handler = proxy.HostAllowList(handler, cfg.AllowHosts, cfg.TargetHeader)
-	handler = proxy.BasicAuth(handler, cfg.Auth)
+	// BearerAuth is a no-op when AuthToken is empty (loopback default).
+	// When bound to a non-loopback, safetyCheck has already refused to
+	// start without a token, so auth here is always enforced.
+	handler := proxy.WrapH2C(proxy.BearerAuth(base, cfg.AuthToken))
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -167,37 +172,18 @@ func run() error {
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
-	upstreamDesc := cfg.Upstream
-	if upstreamDesc == "" {
-		upstreamDesc = "(direct)"
-	}
 	slog.Info("fauxbrowser ready",
 		"version", version,
 		"listen", cfg.Listen,
-		"upstream", upstreamDesc,
-		"profile", cfg.Profile,
-		"auth", cfg.Auth != "",
-		"allow_hosts", cfg.AllowHosts,
-	)
+		"exit_ip", rot.Stats().CurrentIP,
+		"pool_size", pool.Size())
 
-	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Optional admin listener for /healthz.
 	var adminSrv *http.Server
 	if cfg.AdminListen != "" {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok\n"))
-		})
-		adminSrv = &http.Server{Addr: cfg.AdminListen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-		go func() {
-			if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				slog.Error("admin listener", "err", err)
-			}
-		}()
+		adminSrv = startAdmin(cfg.AdminListen, cfg.AdminToken, rot)
 	}
 
 	serverErr := make(chan error, 1)
@@ -216,57 +202,86 @@ func run() error {
 		slog.Info("shutdown signal received, draining (15s max)")
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Warn("main shutdown", "err", err)
-	}
+	shutdownCtx, shCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shCancel()
+	_ = srv.Shutdown(shutdownCtx)
 	if adminSrv != nil {
 		_ = adminSrv.Shutdown(shutdownCtx)
 	}
 	return nil
 }
 
-func bootstrapCA(cfg *config.Config) (*ca.Pair, error) {
-	if cfg.CACertPath != "" && cfg.CAKeyPath != "" {
-		pair, err := ca.Load(cfg.CACertPath, cfg.CAKeyPath)
-		if err != nil {
-			return nil, fmt.Errorf("load CA: %w", err)
+func startAdmin(addr, token string, rot *rotator.Rotator) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rot.Stats())
+	})
+	mux.HandleFunc("/rotate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
 		}
-		slog.Info("loaded CA", "cert", cfg.CACertPath, "key", cfg.CAKeyPath)
-		return pair, nil
-	}
-	pair, err := ca.Generate()
-	if err != nil {
-		return nil, fmt.Errorf("generate CA: %w", err)
-	}
-	slog.Warn("generated ephemeral CA — set -ca-cert/-ca-key for persistence")
-	if cfg.CAOut != "" {
-		if err := pair.Write(cfg.CAOut); err != nil {
-			return nil, fmt.Errorf("write CA: %w", err)
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		if err := rot.ForceRotate(ctx); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
 		}
-		slog.Info("CA persisted", "cert", cfg.CAOut+".pem", "key", cfg.CAOut+".key")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rot.Stats())
+	})
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           proxy.BearerAuth(mux, token),
+		ReadHeaderTimeout: 5 * time.Second,
 	}
-	return pair, nil
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("admin listener", "err", err)
+		}
+	}()
+	return srv
 }
 
+// safetyCheck refuses to start when a listener is bound to a non-
+// loopback interface without a bearer token set. Loopback binds stay
+// auth-free by default — that's the expected single-operator use case.
 func safetyCheck(cfg *config.Config) error {
-	host, _, err := net.SplitHostPort(cfg.Listen)
+	if isNonLoopback(cfg.Listen) {
+		if cfg.AuthToken == "" {
+			return fmt.Errorf("-listen %q is non-loopback; -auth-token (or FAUXBROWSER_AUTH_TOKEN) is mandatory", cfg.Listen)
+		}
+		slog.Warn("proxy listener bound to non-loopback — bearer auth enforced", "listen", cfg.Listen)
+	}
+	if cfg.AdminListen != "" && isNonLoopback(cfg.AdminListen) {
+		if cfg.AdminToken == "" {
+			return fmt.Errorf("-admin-listen %q is non-loopback; -admin-token (or FAUXBROWSER_ADMIN_TOKEN) is mandatory", cfg.AdminListen)
+		}
+		slog.Warn("admin listener bound to non-loopback — bearer auth enforced", "admin-listen", cfg.AdminListen)
+	}
+	return nil
+}
+
+// isNonLoopback returns true for any listen address that is not a
+// loopback interface. Fails safe: unparseable addresses are treated
+// as non-loopback so the auth requirement kicks in.
+func isNonLoopback(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
-		return fmt.Errorf("invalid -listen: %w", err)
+		return true
 	}
-	loopback := host == "" || host == "127.0.0.1" || host == "::1" || host == "localhost"
-	if loopback {
-		return nil
+	if host == "" || host == "localhost" {
+		return false
 	}
-	if cfg.Auth != "" {
-		return nil
+	if ip := net.ParseIP(host); ip != nil {
+		return !ip.IsLoopback()
 	}
-	if cfg.AllowOpen {
-		slog.Warn("listening on non-loopback without auth (-allow-open set)", "listen", cfg.Listen)
-		return nil
-	}
-	return fmt.Errorf("refusing to listen on non-loopback %q without -auth or -allow-open", cfg.Listen)
+	// Hostname that isn't "localhost" — assume non-loopback.
+	return true
 }
 
 func setupLogger(level string) {

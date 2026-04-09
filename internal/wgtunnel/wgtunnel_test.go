@@ -8,14 +8,14 @@ import (
 func TestParseConfigMinimal(t *testing.T) {
 	conf := `
 [Interface]
-PrivateKey = KJZ9wkH7npHQLJk9AmZvVnsuRELB7tzOkG9MC3p+E2g=
+PrivateKey = lb7bveAqoEQlELeAQxUclA8AvIoOO3ZnjuXMV1V3+io=
 Address = 10.2.0.2/32
 DNS = 10.2.0.1
 
 [Peer]
-PublicKey = WTqjxi+neLlaVKk466v+w+LyMWfT+OuKlfbiTkpVdl4=
+PublicKey = sxvlBotEqcKIhj6s6aW+hoKckTf0DPEFJkg99nrQ534=
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = 185.132.133.79:51820
+Endpoint = 192.0.2.1:51820
 PersistentKeepalive = 25
 `
 	cfg, err := parseConfig(conf)
@@ -28,8 +28,8 @@ PersistentKeepalive = 25
 	if len(cfg.PeerPublicKey) != 32 {
 		t.Errorf("PeerPublicKey len = %d, want 32", len(cfg.PeerPublicKey))
 	}
-	if cfg.EndpointHost != "185.132.133.79" {
-		t.Errorf("Endpoint = %q, want 185.132.133.79", cfg.EndpointHost)
+	if cfg.EndpointHost != "192.0.2.1" {
+		t.Errorf("Endpoint = %q, want 192.0.2.1", cfg.EndpointHost)
 	}
 	if cfg.EndpointPort != 51820 {
 		t.Errorf("EndpointPort = %d, want 51820", cfg.EndpointPort)
@@ -50,9 +50,9 @@ PersistentKeepalive = 25
 
 func TestParseConfigRejectsBadKey(t *testing.T) {
 	cases := map[string]string{
-		"missing private key": "[Interface]\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = WTqjxi+neLlaVKk466v+w+LyMWfT+OuKlfbiTkpVdl4=\nEndpoint = 1.2.3.4:5\n",
-		"missing endpoint":    "[Interface]\nPrivateKey = KJZ9wkH7npHQLJk9AmZvVnsuRELB7tzOkG9MC3p+E2g=\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = WTqjxi+neLlaVKk466v+w+LyMWfT+OuKlfbiTkpVdl4=\n",
-		"bad b64 key":         "[Interface]\nPrivateKey = not-base64!!\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = WTqjxi+neLlaVKk466v+w+LyMWfT+OuKlfbiTkpVdl4=\nEndpoint = 1.2.3.4:5\n",
+		"missing private key": "[Interface]\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = sxvlBotEqcKIhj6s6aW+hoKckTf0DPEFJkg99nrQ534=\nEndpoint = 1.2.3.4:5\n",
+		"missing endpoint":    "[Interface]\nPrivateKey = lb7bveAqoEQlELeAQxUclA8AvIoOO3ZnjuXMV1V3+io=\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = sxvlBotEqcKIhj6s6aW+hoKckTf0DPEFJkg99nrQ534=\n",
+		"bad b64 key":         "[Interface]\nPrivateKey = not-base64!!\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = sxvlBotEqcKIhj6s6aW+hoKckTf0DPEFJkg99nrQ534=\nEndpoint = 1.2.3.4:5\n",
 	}
 	for name, conf := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -68,19 +68,19 @@ func TestParseConfigCommentsAndBlanks(t *testing.T) {
 # comment
 [Interface]
 # another comment
-PrivateKey = KJZ9wkH7npHQLJk9AmZvVnsuRELB7tzOkG9MC3p+E2g=
+PrivateKey = lb7bveAqoEQlELeAQxUclA8AvIoOO3ZnjuXMV1V3+io=
 Address = 10.2.0.2/32
 
 [Peer]
 # peer comment
-PublicKey = WTqjxi+neLlaVKk466v+w+LyMWfT+OuKlfbiTkpVdl4=
-Endpoint = 185.132.133.79:51820
+PublicKey = sxvlBotEqcKIhj6s6aW+hoKckTf0DPEFJkg99nrQ534=
+Endpoint = 192.0.2.1:51820
 `
 	cfg, err := parseConfig(conf)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if !strings.HasPrefix(cfg.EndpointHost, "185.") {
+	if !strings.HasPrefix(cfg.EndpointHost, "192.") {
 		t.Errorf("endpoint = %q", cfg.EndpointHost)
 	}
 }

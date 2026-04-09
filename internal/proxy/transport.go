@@ -1,3 +1,23 @@
+// Package proxy holds the forwarder transport and the plaintext h2c
+// listener handler.
+//
+// The transport wraps a single tls-client (profile selected via
+// SelectProfile, see profiles.go) dispatched via a custom ContextDialer
+// provided by the rotator, which routes through the current WireGuard
+// tunnel. It:
+//
+//  1. Forges the selected browser's TLS fingerprint + header bundle on
+//     every outbound request.
+//  2. Honors caller-set Cookie headers as-is (those are "the client's
+//     cookies" — not ours) and never clears them from the incoming
+//     request.
+//  3. Maintains an internal cookie jar per tls-client so upstream
+//     Set-Cookie headers persist across requests from the same worker.
+//     The jar is cleared on rotation.
+//  4. After receiving a response, runs the rotator's 429/403 heuristic
+//     and asynchronously triggers a rotation if matched. The caller
+//     still gets the current response; the rotation affects subsequent
+//     requests.
 package proxy
 
 import (
@@ -5,7 +25,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	nurl "net/url"
 	"strings"
 	"sync"
 	"time"
@@ -13,276 +32,140 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"golang.org/x/net/proxy"
-
-	"github.com/onnimonni/fauxbrowser/internal/solver"
 )
 
-// TransportOptions parameterize the tls-client pool.
+// RotationHook is called with every upstream response so the rotator
+// can decide whether to rotate. The host parameter drives the
+// rotator's per-host quarantine and debounce logic.
+type RotationHook interface {
+	RotateIfTriggered(host string, status int, h http.Header) (bool, string)
+}
+
+// TransportOptions parameterize the tls-client transport.
 type TransportOptions struct {
-	DefaultProfile string
-	UpstreamProxy  string
+	// Dialer routes outbound TCP through the WireGuard tunnel. Must be
+	// non-nil — fauxbrowser has no bare-metal fallback.
+	Dialer proxy.ContextDialer
+
+	// TimeoutSeconds is the per-request upstream timeout.
 	TimeoutSeconds int
-	Insecure       bool
 
-	ProfileHeader string // e.g. "X-Fauxbrowser-Profile"
-	SessionHeader string // e.g. "X-Fauxbrowser-Session"
-	MaxSessions   int
+	// Profile selects the (TLS fingerprint, UA, Client-Hints) bundle.
+	// Empty = DefaultProfile (chrome146). Unknown values fall back to
+	// DefaultProfile with a slog.Warn.
+	Profile string
 
-	// SolverCache is optional. When set, responses that look like a WAF
-	// challenge trigger a solve via the wrapped Solver; resulting cookies
-	// are stamped on the request and the upstream is re-fetched once.
-	SolverCache  *solver.Cache
-	// SolverEgress is the proxy URL the solver itself should egress via.
-	// Typically differs from UpstreamProxy because the solver runs in its
-	// own container and can't reach host-local addresses. Empty falls
-	// back to UpstreamProxy.
-	SolverEgress string
-
-	// CustomDialer, when non-nil, overrides all outbound dialing. Used
-	// to route upstream fetches through an embedded WireGuard tunnel.
-	// Mutually exclusive with UpstreamProxy at runtime: when CustomDialer
-	// is set, UpstreamProxy is ignored for fast-path dispatch.
-	CustomDialer proxy.ContextDialer
+	// Rotator is notified of every upstream response. May be nil in
+	// tests.
+	Rotator RotationHook
 }
 
-// Transport is an http.RoundTripper backed by a pool of tls-client clients,
-// keyed by (profile, session). Empty session = cookie-neutral shared client.
+// Transport is an http.RoundTripper backed by a single tls-client with
+// a pinned browser profile. The client is rebuilt on RotateJar() which
+// is how the rotator clears cookie state after an IP swap.
 type Transport struct {
-	opts TransportOptions
+	opts    TransportOptions
+	profile BrowserProfile
 
-	mu   sync.Mutex
-	pool map[poolKey]tls_client.HttpClient
-	lru  []poolKey
+	mu     sync.RWMutex
+	client tls_client.HttpClient
 }
 
-type poolKey struct {
-	profile string
-	session string
-}
-
-func NewTransport(opts TransportOptions) *Transport {
-	_ = SelectProfile(opts.DefaultProfile) // validate / warn eagerly
-	if opts.MaxSessions <= 0 {
-		opts.MaxSessions = 256
+// NewTransport constructs a Transport and builds its initial client.
+func NewTransport(opts TransportOptions) (*Transport, error) {
+	if opts.Dialer == nil {
+		return nil, fmt.Errorf("transport: Dialer is required")
 	}
 	if opts.TimeoutSeconds <= 0 {
 		opts.TimeoutSeconds = 60
 	}
-	return &Transport{
-		opts: opts,
-		pool: make(map[poolKey]tls_client.HttpClient),
+	t := &Transport{
+		opts:    opts,
+		profile: SelectProfile(opts.Profile),
 	}
+	if err := t.rebuildClient(); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// Profile returns the resolved browser profile this transport is using.
+func (t *Transport) Profile() BrowserProfile { return t.profile }
+
+func (t *Transport) rebuildClient() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.client != nil {
+		t.client.CloseIdleConnections()
+	}
+	opts := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(t.opts.TimeoutSeconds),
+		tls_client.WithClientProfile(t.profile.TLSProfile),
+		tls_client.WithCookieJar(tls_client.NewCookieJar()),
+		tls_client.WithRandomTLSExtensionOrder(),
+		tls_client.WithProxyDialerFactory(func(
+			_ string,
+			_ time.Duration,
+			_ *net.TCPAddr,
+			_ fhttp.Header,
+			_ tls_client.Logger,
+		) (proxy.ContextDialer, error) {
+			return t.opts.Dialer, nil
+		}),
+	}
+	c, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
+	if err != nil {
+		return fmt.Errorf("tls-client new: %w", err)
+	}
+	t.client = c
+	return nil
+}
+
+// RotateJar clears all cookies held by the tls-client jar and rebuilds
+// the client. Called by the rotator after an IP swap so we never leak
+// cookies bound to the old exit IP.
+//
+// Caller-supplied Cookie request headers are untouched — they live on
+// the inbound *http.Request and are re-sent verbatim by dispatch().
+func (t *Transport) RotateJar() error {
+	return t.rebuildClient()
 }
 
 func (t *Transport) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for _, c := range t.pool {
-		c.CloseIdleConnections()
-	}
-	t.pool = map[poolKey]tls_client.HttpClient{}
-	t.lru = nil
-}
-
-func (t *Transport) clientFor(profile, session string) (tls_client.HttpClient, error) {
-	key := poolKey{profile: profile, session: session}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if c, ok := t.pool[key]; ok {
-		if session != "" {
-			t.touchLRULocked(key)
-		}
-		return c, nil
-	}
-	c, err := t.buildClient(profile, session)
-	if err != nil {
-		return nil, err
-	}
-	t.pool[key] = c
-	if session != "" {
-		t.lru = append(t.lru, key)
-		t.evictLocked()
-	}
-	return c, nil
-}
-
-func (t *Transport) touchLRULocked(key poolKey) {
-	for i, k := range t.lru {
-		if k == key {
-			t.lru = append(t.lru[:i], t.lru[i+1:]...)
-			break
-		}
-	}
-	t.lru = append(t.lru, key)
-}
-
-func (t *Transport) evictLocked() {
-	for len(t.lru) > t.opts.MaxSessions {
-		victim := t.lru[0]
-		t.lru = t.lru[1:]
-		if c, ok := t.pool[victim]; ok {
-			c.CloseIdleConnections()
-			delete(t.pool, victim)
-		}
+	if t.client != nil {
+		t.client.CloseIdleConnections()
+		t.client = nil
 	}
 }
 
-func (t *Transport) buildClient(profile, session string) (tls_client.HttpClient, error) {
-	p := SelectProfile(profile)
-	var jar tls_client.CookieJar
-	if session == "" {
-		jar = noopCookieJar{}
-	} else {
-		jar = tls_client.NewCookieJar()
-	}
-	opts := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(t.opts.TimeoutSeconds),
-		tls_client.WithClientProfile(p),
-		tls_client.WithCookieJar(jar),
-		tls_client.WithRandomTLSExtensionOrder(),
-	}
-	switch {
-	case t.opts.CustomDialer != nil:
-		// Custom dialer path (embedded WireGuard, netstack, etc.).
-		// tls-client has no direct "WithContextDialer" but its
-		// WithProxyDialerFactory hook fires whenever a factory is set,
-		// regardless of whether a proxy URL is present. We hand it a
-		// factory that ignores its inputs and returns our ContextDialer.
-		opts = append(opts,
-			tls_client.WithProxyDialerFactory(func(
-				_ string,
-				_ time.Duration,
-				_ *net.TCPAddr,
-				_ fhttp.Header,
-				_ tls_client.Logger,
-			) (proxy.ContextDialer, error) {
-				return t.opts.CustomDialer, nil
-			}),
-		)
-	case t.opts.UpstreamProxy != "":
-		opts = append(opts, tls_client.WithProxyUrl(t.opts.UpstreamProxy))
-	}
-	if t.opts.Insecure {
-		opts = append(opts, tls_client.WithInsecureSkipVerify())
-	}
-	c, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
-	if err != nil {
-		return nil, fmt.Errorf("tls-client new: %w", err)
-	}
-	return c, nil
-}
-
-// RoundTrip implements http.RoundTripper. Body is streamed; context from
-// the incoming request is propagated so client disconnects cancel upstream.
-// When a SolverCache is configured and the upstream response looks like a
-// WAF challenge, fauxbrowser invokes the solver, stamps the resulting
-// cookies + User-Agent on the request, and re-fetches once.
+// RoundTrip implements http.RoundTripper.
 func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
-	profile := firstNonEmpty(r.Header.Get(t.opts.ProfileHeader), t.opts.DefaultProfile)
-	session := r.Header.Get(t.opts.SessionHeader)
-
-	// Proactively stamp cookies from a prior solve so repeat requests
-	// don't re-trigger the solver on every hit.
-	var primeCookies []*http.Cookie
-	var primeUA string
-	if t.opts.SolverCache != nil {
-		if prior := t.opts.SolverCache.Peek(session, r.URL.Host); prior != nil {
-			primeCookies = prior.Cookies
-			primeUA = prior.UserAgent
+	resp, err := t.dispatch(r)
+	if err != nil {
+		return nil, err
+	}
+	if t.opts.Rotator != nil {
+		host := r.URL.Hostname()
+		if fired, reason := t.opts.Rotator.RotateIfTriggered(host, resp.StatusCode, resp.Header); fired {
+			slog.Info("rotation triggered by response heuristic",
+				"status", resp.StatusCode, "host", host, "reason", reason)
 		}
 	}
-
-	resp, err := t.dispatch(r, profile, session, primeCookies, primeUA)
-	if err != nil {
-		return nil, err
-	}
-	if t.opts.SolverCache == nil || t.opts.SolverCache.Solver() == nil {
-		return resp, nil
-	}
-	if !solver.LooksLikeChallenge(resp.StatusCode, resp.Header) {
-		return resp, nil
-	}
-	// If we had primed with stale cached cookies, drop them so the solver
-	// gets called fresh.
-	if primeCookies != nil {
-		t.opts.SolverCache.Invalidate(session, r.URL.Host)
-	}
-
-	slog.Info("challenge detected, invoking solver",
-		"status", resp.StatusCode, "host", r.URL.Host, "session", session)
-	// Drop the challenge response body — we'll replace the whole response.
-	_ = resp.Body.Close()
-
-	solverEgress := t.opts.SolverEgress
-	if solverEgress == "" {
-		solverEgress = t.opts.UpstreamProxy
-	}
-	result, solveErr := t.opts.SolverCache.LookupOrSolve(
-		r.Context(), session, r.URL, solverEgress)
-	if solveErr != nil || result == nil {
-		slog.Warn("solver failed; returning original challenge response",
-			"err", solveErr)
-		// Re-issue the fetch so the caller at least sees a body.
-		return t.dispatch(r, profile, session, nil, "")
-	}
-
-	retryResp, err := t.dispatch(r, profile, session, result.Cookies, result.UserAgent)
-	if err != nil {
-		return nil, err
-	}
-	// If the retry STILL looks like a challenge, invalidate and bail —
-	// the cached cookies are stale or the solver's IP no longer matches.
-	if solver.LooksLikeChallenge(retryResp.StatusCode, retryResp.Header) {
-		slog.Warn("re-fetch after solve still challenged; invalidating",
-			"host", r.URL.Host)
-		t.opts.SolverCache.Invalidate(session, r.URL.Host)
-	}
-	return retryResp, nil
+	return resp, nil
 }
 
-// dispatch performs one upstream fetch via the (profile, session) client.
-// Optional stampCookies/stampUA override the request cookies/UA — used by
-// the solver retry path.
-func (t *Transport) dispatch(r *http.Request, profile, session string, stampCookies []*http.Cookie, stampUA string) (*http.Response, error) {
-	client, err := t.clientFor(profile, session)
-	if err != nil {
-		return nil, err
+func (t *Transport) dispatch(r *http.Request) (*http.Response, error) {
+	t.mu.RLock()
+	client := t.client
+	t.mu.RUnlock()
+	if client == nil {
+		return nil, fmt.Errorf("transport closed")
 	}
 
-	egress := cloneHeader(r.Header)
-	for _, h := range []string{
-		t.opts.ProfileHeader,
-		t.opts.SessionHeader,
-		"X-Target-URL",
-		"X-Target-Scheme",
-		"Proxy-Authorization",
-		"Proxy-Connection",
-	} {
-		egress.Del(h)
-	}
-	for _, h := range hopByHopFromConnection(r.Header) {
-		egress.Del(h)
-	}
-	for _, h := range staticHopByHop {
-		egress.Del(h)
-	}
-	egress = applyDefaults(egress, profile)
-
-	if stampUA != "" {
-		egress.Set("User-Agent", stampUA)
-	}
-	if len(stampCookies) > 0 {
-		// Merge into any existing Cookie header.
-		existing := egress.Get("Cookie")
-		var parts []string
-		if existing != "" {
-			parts = append(parts, existing)
-		}
-		for _, c := range stampCookies {
-			parts = append(parts, c.Name+"="+c.Value)
-		}
-		egress.Set("Cookie", strings.Join(parts, "; "))
-	}
+	egress := scrubOutboundHeaders(r.Header)
+	egress = applyProfileDefaults(egress, t.profile)
 
 	body := r.Body
 	if body == nil {
@@ -294,9 +177,7 @@ func (t *Transport) dispatch(r *http.Request, profile, session string, stampCook
 	}
 	freq.ContentLength = r.ContentLength
 	freq.Host = r.Host
-	// Replace tls-client's per-profile default headers with ours. tls-client
-	// pre-populates freq.Header (including an older User-Agent) from the
-	// selected ClientProfile; using Set + Del guarantees our values win.
+	// Replace tls-client's per-profile default headers with ours.
 	for k, vs := range egress {
 		ck := fhttp.CanonicalHeaderKey(k)
 		freq.Header.Del(ck)
@@ -327,6 +208,37 @@ func (t *Transport) dispatch(r *http.Request, profile, session string, stampCook
 	return out, nil
 }
 
+// scrubOutboundHeaders clones the incoming request headers and removes
+// everything that must not reach the upstream target: fauxbrowser
+// control headers, hop-by-hop headers (RFC 7230 §6.1), and anonymity-
+// breaking forwarding headers. Pure function — called from dispatch()
+// and tested directly.
+func scrubOutboundHeaders(in http.Header) http.Header {
+	out := cloneHeader(in)
+	for _, h := range fauxbrowserControlHeaders {
+		out.Del(h)
+	}
+	for _, h := range hopByHopFromConnection(in) {
+		out.Del(h)
+	}
+	for _, h := range staticHopByHop {
+		out.Del(h)
+	}
+	for _, h := range anonymityScrub {
+		out.Del(h)
+	}
+	return out
+}
+
+// fauxbrowserControlHeaders are meta-headers the proxy uses to route
+// requests; they must never leak to the target.
+var fauxbrowserControlHeaders = []string{
+	"X-Target-URL",
+	"X-Target-Scheme",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+}
+
 var staticHopByHop = []string{
 	"Connection",
 	"Keep-Alive",
@@ -336,6 +248,29 @@ var staticHopByHop = []string{
 	"Trailer",
 	"Transfer-Encoding",
 	"Upgrade",
+}
+
+// anonymityScrub is the set of headers that would leak origin IPs,
+// proxy topology, or internal infrastructure details if forwarded to
+// the target. Stripped unconditionally in dispatch().
+var anonymityScrub = []string{
+	"X-Forwarded-For",
+	"X-Forwarded-Host",
+	"X-Forwarded-Proto",
+	"X-Forwarded-Port",
+	"X-Real-Ip",
+	"X-Client-Ip",
+	"X-Originating-Ip",
+	"X-Remote-Ip",
+	"X-Remote-Addr",
+	"Cf-Connecting-Ip",
+	"True-Client-Ip",
+	"Fastly-Client-Ip",
+	"X-Cluster-Client-Ip",
+	"Via",
+	"Forwarded", // RFC 7239
+	"X-Proxy-User",
+	"X-Proxyuser-Ip",
 }
 
 func hopByHopFromConnection(h http.Header) []string {
@@ -361,17 +296,3 @@ func cloneHeader(h http.Header) http.Header {
 	return out
 }
 
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
-}
-
-// --- cookie-neutral jar ---
-
-type noopCookieJar struct{}
-
-func (noopCookieJar) SetCookies(_ *nurl.URL, _ []*fhttp.Cookie)    {}
-func (noopCookieJar) Cookies(_ *nurl.URL) []*fhttp.Cookie          { return nil }
-func (noopCookieJar) GetAllCookies() map[string][]*fhttp.Cookie    { return nil }
