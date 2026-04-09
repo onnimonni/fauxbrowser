@@ -60,6 +60,14 @@ func NewHandler(opts Options) http.Handler {
 			slog.Warn("upstream failed", "err", err, "url", safeURL(r))
 			http.Error(w, "fauxbrowser upstream: "+err.Error(), http.StatusBadGateway)
 		},
+		// FlushInterval -1 flushes after every write so streaming
+		// responses (SSE, long-polling) reach the caller promptly.
+		// Issue #2 reported h2c concurrent-stream INTERNAL_ERROR
+		// failures under this flag; those turned out to share a
+		// root cause with issue #1 — the auto-decompression Content
+		// -Length mismatch in transport.dispatch() — and were fixed
+		// when #1 was fixed in v0.7.0 by stripping Content-Encoding
+		// + Content-Length and setting out.ContentLength = -1.
 		FlushInterval: -1,
 	}
 
