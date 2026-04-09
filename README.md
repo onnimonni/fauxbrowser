@@ -37,16 +37,47 @@ go build -o fauxbrowser ./cmd/fauxbrowser
   -admin-listen 127.0.0.1:18444
 ```
 
-## Client invocation
+### Gluetun-compatible env vars
 
-Two request modes:
+If you don't want to manage a `.conf` file, fauxbrowser can bootstrap
+from just the WireGuard private key. The same env-var names that
+[gluetun](https://github.com/qdm12/gluetun) uses for ProtonVPN are
+honored as aliases:
 
 ```sh
-# 1. X-Target-URL header
+WIREGUARD_PRIVATE_KEY="wOEI9rqqbDwnN8/Bpp22sVz48T71vJ4fYmFWujulwUU=" \
+SERVER_COUNTRIES="Netherlands,Germany" \
+FREE_ONLY=on \
+./fauxbrowser
+```
+
+| gluetun env             | fauxbrowser equivalent              |
+|-------------------------|-------------------------------------|
+| `WIREGUARD_PRIVATE_KEY` | `-wg-private-key` / `FAUXBROWSER_WG_PRIVATE_KEY` |
+| `SERVER_COUNTRIES`      | `-vpn-country` / `FAUXBROWSER_VPN_COUNTRIES` |
+| `FREE_ONLY=on`          | `-vpn-tier free` / `FAUXBROWSER_VPN_TIER=free` |
+
+`SERVER_COUNTRIES` accepts both ISO-2 codes (`NL,DE`) and country names
+(`Netherlands,Germany`). When bootstrapping from the key alone, the
+interface address (`10.2.0.2/32`), DNS (`10.2.0.1`), MTU (`1420`), and
+`PersistentKeepalive=25` are defaulted to ProtonVPN's published values.
+
+## Client invocation
+
+Three request modes:
+
+```sh
+# 1. X-Target-URL header (full feature path: TLS forging, header
+#    scrub, rotation, cookie jar)
 curl http://127.0.0.1:18443/ -H 'X-Target-URL: https://example.com/path'
 
-# 2. Classic forward-proxy
+# 2. Classic forward-proxy with absolute URI (same feature set)
 curl -x http://127.0.0.1:18443 http://example.com/path
+
+# 3. CONNECT tunnel (HTTP_PROXY style for HTTPS targets — Lightpanda,
+#    headless browsers, anything that respects HTTP_PROXY env var)
+curl -x http://127.0.0.1:18443 https://example.com/path
+HTTPS_PROXY=http://127.0.0.1:18443 some-other-tool
 ```
 
 HTTP/2 cleartext over a single TCP connection:
@@ -56,8 +87,33 @@ curl --http2-prior-knowledge -H 'X-Target-URL: https://example.com/' \
   http://127.0.0.1:18443/
 ```
 
-CONNECT is **not** supported — fauxbrowser is a forwarder, not a
-tunnel. Pass the target URL and let fauxbrowser do the TLS.
+### CONNECT tunnel mode caveats
+
+CONNECT is the right mode for routing an HTTP_PROXY-aware client
+(Lightpanda, a headless browser, a Python `requests` script with
+`HTTPS_PROXY` set) through fauxbrowser purely for **VPN egress**. But:
+
+- **TLS fingerprint forging is bypassed.** The client speaks its own
+  TLS handshake to the target through the tunnel; fauxbrowser sees
+  only encrypted bytes. If the target is behind a TLS-fingerprint-
+  aware WAF (Cloudflare IUAM, Akamai Bot Manager, DataDome) you will
+  fail. For those targets, use X-Target-URL mode.
+- **Rotation visibility is bypassed.** fauxbrowser cannot see HTTP
+  status codes inside the encrypted stream, so the 429/403/503
+  heuristic does NOT fire on CONNECT traffic. You can still rotate
+  manually via `POST /rotate`.
+- **Header scrub is bypassed.** `X-Forwarded-For`, `Via`, etc. that
+  the client sets are inside the encrypted stream — fauxbrowser
+  never sees them. Make sure your client doesn't set them.
+- **Per-host quarantine still applies at dial time.** If host A was
+  recently quarantined by a 429 in X-Target-URL mode, a CONNECT dial
+  to A blocks on the gate.
+- **HTTP/1.1 only.** h2c CONNECT is not supported (h2 strips
+  Hijacker support).
+- **Auth.** Set `Proxy-Authorization: Bearer <token>` (the
+  forward-proxy convention) or `Authorization: Bearer <token>`
+  (also accepted). Failure on CONNECT returns 407 Proxy
+  Authentication Required.
 
 ### From Elixir (Mint / Finch)
 

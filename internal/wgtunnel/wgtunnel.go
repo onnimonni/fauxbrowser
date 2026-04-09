@@ -62,6 +62,35 @@ func LoadConfig(path string) (*Config, error) {
 	return parseConfig(string(data))
 }
 
+// ConfigFromPrivateKey builds a minimal Config from just a base64
+// WireGuard private key. The interface address, DNS, MTU, and
+// PersistentKeepalive are defaulted to ProtonVPN's published values
+// (10.2.0.2/32, 10.2.0.1, 1420, 25s). Peer fields are left empty so
+// the rotator can fill them in from the catalog.
+//
+// This is the gluetun-style entry point: a single WIREGUARD_PRIVATE_KEY
+// env var is enough, no .conf file needed.
+//
+// Note: PersistentKeepalive=25 is critical even though it isn't
+// strictly required by the WireGuard handshake itself. Proton's free
+// pool sits behind aggressive NAT/CGNAT timeouts; without keepalive,
+// userspace wireguard-go's UDP socket can be silently mapped to a
+// different external port between handshake initiation and response,
+// causing systematic handshake failures across the pool.
+func ConfigFromPrivateKey(privateKeyB64 string) (*Config, error) {
+	b, err := base64.StdEncoding.DecodeString(privateKeyB64)
+	if err != nil || len(b) != 32 {
+		return nil, errors.New("bad PrivateKey: must be 32-byte base64")
+	}
+	return &Config{
+		PrivateKey:        b,
+		Addresses:         []netip.Addr{netip.MustParseAddr("10.2.0.2")},
+		DNS:               []netip.Addr{netip.MustParseAddr("10.2.0.1")},
+		MTU:               1420,
+		PersistentKeepAlv: 25,
+	}, nil
+}
+
 func parseConfig(text string) (*Config, error) {
 	cfg := &Config{MTU: 1420}
 	section := ""
