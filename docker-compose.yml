@@ -1,0 +1,45 @@
+# Example stack: fauxbrowser + gluetun (ProtonVPN custom WireGuard).
+#
+# SECRETS: put your WireGuard private key etc. in a local .env file next to
+# this compose file. .env is gitignored. DO NOT commit WireGuard keys.
+#
+# Required env vars (see .env.example):
+#   WIREGUARD_PRIVATE_KEY
+#   WIREGUARD_PUBLIC_KEY
+#   WIREGUARD_ADDRESSES
+#   VPN_ENDPOINT_IP
+#   VPN_ENDPOINT_PORT
+
+services:
+  gluetun:
+    image: ghcr.io/qdm12/gluetun:latest
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: custom
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY}
+      WIREGUARD_PUBLIC_KEY: ${WIREGUARD_PUBLIC_KEY}
+      WIREGUARD_ADDRESSES: ${WIREGUARD_ADDRESSES}
+      VPN_ENDPOINT_IP: ${VPN_ENDPOINT_IP}
+      VPN_ENDPOINT_PORT: ${VPN_ENDPOINT_PORT}
+      HTTPPROXY: "on"
+      HTTPPROXY_STEALTH: "on"
+    ports:
+      - "127.0.0.1:18443:18443"   # published by fauxbrowser via net=service:gluetun
+    restart: unless-stopped
+
+  fauxbrowser:
+    build: .
+    # Share gluetun's network namespace: all fauxbrowser egress exits via VPN,
+    # and gluetun publishes fauxbrowser's 18443 port on the host.
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    command:
+      - "-listen=0.0.0.0:18443"
+      - "-upstream=http://127.0.0.1:8888"   # gluetun's HTTP proxy inside the shared netns
+      - "-profile=chrome146"
+    restart: unless-stopped
