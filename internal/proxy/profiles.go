@@ -229,4 +229,34 @@ var softDefaults = map[string]string{
 	"Sec-Fetch-Mode":            "navigate",
 	"Sec-Fetch-Site":            "none",
 	"Sec-Fetch-User":            "?1",
+	"Priority":                  "u=0, i",
+}
+
+// chromeHeaderOrder is the exact order Chrome 146 sends regular
+// (non-pseudo) headers in the h2 HEADERS frame, captured from a
+// real Chrome 146 navigation via tls.peet.ws/api/all on 2026-04-09.
+//
+// Some WAFs (Cloudflare Enterprise, DataDome) reportedly fingerprint
+// regular header order in addition to the Akamai-style h2 fingerprint
+// (which only covers SETTINGS + WINDOW_UPDATE + pseudo-header order +
+// PRIORITY). Setting this order in the fhttp request via
+// fhttp.HeaderOrderKey makes our h2 HEADERS frame look identical to
+// what a real Chrome navigation would produce.
+//
+// Lowercase because fhttp.HeaderOrderKey requires lowercase keys.
+var chromeHeaderOrder = []string{
+	"sec-ch-ua",
+	"sec-ch-ua-mobile",
+	"sec-ch-ua-platform",
+	"upgrade-insecure-requests",
+	"user-agent",
+	"accept-language",
+	"accept",
+	"sec-fetch-site",
+	"sec-fetch-mode",
+	"sec-fetch-user",
+	"sec-fetch-dest",
+	"accept-encoding",
+	"priority",
+	"cookie",
 }

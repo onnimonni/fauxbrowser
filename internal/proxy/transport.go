@@ -337,6 +337,11 @@ func (t *Transport) dispatch(r *http.Request) (*http.Response, error) {
 			freq.Header.Add(ck, v)
 		}
 	}
+	// Pin regular header order to match Chrome 146's exact order.
+	// fhttp uses HeaderOrderKey to control the h2 HEADERS frame
+	// serialization; without it, Go's map iteration order produces
+	// a random/inconsistent order that some WAFs fingerprint.
+	freq.Header[fhttp.HeaderOrderKey] = chromeHeaderOrder
 
 	fresp, err := client.Do(freq)
 	if err != nil {
