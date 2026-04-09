@@ -50,9 +50,15 @@ import (
 //	    -out internal/proxy/fingerprints/chrome146.clienthello.hex
 var chrome146Captured = func() profiles.ClientProfile {
 	base := profiles.Chrome_146
+	// Client + Version MUST match bogdanfinn's built-in Chrome_146
+	// (Client="Chrome", Version="146") — the h2 connection pool in
+	// bogdanfinn/fhttp keys partly on ClientHelloID.Str(). A
+	// different Client/Version causes cross-host connection pool
+	// contamination where h2 connections from host A get reused
+	// for host B, producing "certificate valid for X, not Y" errors.
 	customID := utls.ClientHelloID{
-		Client:  "Chrome146Captured",
-		Version: "custom",
+		Client:  "Chrome",
+		Version: "146",
 		SpecFactory: func() (utls.ClientHelloSpec, error) {
 			spec, err := fingerprints.Chrome146()
 			if err != nil {

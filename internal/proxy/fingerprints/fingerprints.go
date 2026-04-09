@@ -46,30 +46,40 @@ var chrome146Hex string
 
 var (
 	chrome146Once sync.Once
-	chrome146Spec *utls.ClientHelloSpec
+	chrome146Raw  []byte
 	chrome146Err  error
 )
 
-// Chrome146 returns the captured ClientHelloSpec for Chromium /
-// Google Chrome 146. The spec is loaded lazily on first call and
-// cached for the lifetime of the process. Returns (nil, err) if the
-// committed hex file is corrupt or unparseable.
+func init() {
+	raw, err := hex.DecodeString(strings.TrimSpace(chrome146Hex))
+	if err != nil {
+		chrome146Err = fmt.Errorf("fingerprints: decode chrome146 hex: %w", err)
+		return
+	}
+	// Validate once at startup.
+	f := &utls.Fingerprinter{AllowBluntMimicry: true}
+	if _, err := f.FingerprintClientHello(raw); err != nil {
+		chrome146Err = fmt.Errorf("fingerprints: parse chrome146 ClientHello: %w", err)
+		return
+	}
+	chrome146Raw = raw
+}
+
+// Chrome146 returns a FRESH ClientHelloSpec for Chromium / Google
+// Chrome 146. A new spec is parsed on every call because utls
+// extensions are mutable structs — if the same spec is shared
+// across connections, the first connection's SNI setting leaks to
+// subsequent connections for different hosts, causing cross-host
+// h2 connection pool contamination.
+//
+// The parsing is cheap (~50µs) and only happens once per new TLS
+// connection (not per HTTP request — h2 multiplexes on one conn).
 func Chrome146() (*utls.ClientHelloSpec, error) {
-	chrome146Once.Do(func() {
-		raw, err := hex.DecodeString(strings.TrimSpace(chrome146Hex))
-		if err != nil {
-			chrome146Err = fmt.Errorf("fingerprints: decode chrome146 hex: %w", err)
-			return
-		}
-		f := &utls.Fingerprinter{AllowBluntMimicry: true}
-		spec, err := f.FingerprintClientHello(raw)
-		if err != nil {
-			chrome146Err = fmt.Errorf("fingerprints: parse chrome146 ClientHello: %w", err)
-			return
-		}
-		chrome146Spec = spec
-	})
-	return chrome146Spec, chrome146Err
+	if chrome146Err != nil {
+		return nil, chrome146Err
+	}
+	f := &utls.Fingerprinter{AllowBluntMimicry: true}
+	return f.FingerprintClientHello(chrome146Raw)
 }
 
 // MustChrome146 is like Chrome146 but panics on error. Intended for

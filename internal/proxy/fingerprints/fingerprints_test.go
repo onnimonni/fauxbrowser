@@ -2,6 +2,8 @@ package fingerprints
 
 import (
 	"testing"
+
+	utls "github.com/bogdanfinn/utls"
 )
 
 // TestChrome146LoadsCleanly verifies the committed hex file is well-
@@ -31,9 +33,10 @@ func TestChrome146LoadsCleanly(t *testing.T) {
 		len(spec.CipherSuites), len(spec.Extensions))
 }
 
-// TestChrome146Memoized verifies the sync.Once caching works — two
-// calls return pointer-equal specs.
-func TestChrome146Memoized(t *testing.T) {
+// TestChrome146ReturnsFreshSpec verifies each call returns a
+// distinct spec instance — critical for avoiding cross-host h2
+// connection contamination from shared mutable extension state.
+func TestChrome146ReturnsFreshSpec(t *testing.T) {
 	a, err := Chrome146()
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +45,45 @@ func TestChrome146Memoized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a != b {
-		t.Errorf("Chrome146 returned different pointers: %p vs %p", a, b)
+	if a == b {
+		t.Error("Chrome146 should return fresh specs, got same pointer")
+	}
+	// Both should have the same structure.
+	if len(a.CipherSuites) != len(b.CipherSuites) {
+		t.Errorf("cipher count mismatch: %d vs %d", len(a.CipherSuites), len(b.CipherSuites))
+	}
+}
+
+// TestChrome146SNIDoesNotLeak is the regression test for the
+// cross-host h2 connection pool contamination bug. If the spec is
+// shared (cached pointer), mutating SNI on connection A leaks to
+// connection B — causing "certificate valid for X, not Y" errors
+// in production.
+func TestChrome146SNIDoesNotLeak(t *testing.T) {
+	a, _ := Chrome146()
+	b, _ := Chrome146()
+
+	// Find the SNI extension in each spec and set different hosts.
+	setSNI := func(spec *utls.ClientHelloSpec, host string) {
+		for _, ext := range spec.Extensions {
+			if sni, ok := ext.(*utls.SNIExtension); ok {
+				sni.ServerName = host
+				return
+			}
+		}
+		t.Fatal("SNIExtension not found in spec")
+	}
+
+	setSNI(a, "host-a.example.com")
+	setSNI(b, "host-b.example.com")
+
+	// Verify mutation on A didn't leak to B.
+	for _, ext := range b.Extensions {
+		if sni, ok := ext.(*utls.SNIExtension); ok {
+			if sni.ServerName != "host-b.example.com" {
+				t.Errorf("SNI leaked across specs: got %q, want host-b.example.com (host-a.example.com leaked)", sni.ServerName)
+			}
+			return
+		}
 	}
 }
