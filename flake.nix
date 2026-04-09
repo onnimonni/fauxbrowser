@@ -11,7 +11,7 @@
       # Go build output. Called per-system below.
       mkFauxbrowser = pkgs: pkgs.buildGoModule rec {
         pname = "fauxbrowser";
-        version = "0.7.0";
+        version = "0.8.0";
         src = ./.;
         vendorHash = "sha256-IJQBeCjtTnTiipDq/ScexOnmZcmli94OvairWF7olFo=";
         subPackages = [ "cmd/fauxbrowser" ];
