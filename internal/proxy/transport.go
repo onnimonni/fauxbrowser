@@ -23,6 +23,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -81,6 +82,13 @@ type TransportOptions struct {
 	// meaningful — without it, cookies from different exits would
 	// pollute each other).
 	ExitIPProvider func() string
+
+	// Stats tracks per-host request outcomes for diagnostics.
+	// Nil = no tracking. When set, RoundTrip records every
+	// request/challenge/solve/rotation event, and ShouldBlock
+	// is checked before dispatch to prevent futile traffic to
+	// hosts diagnosed as unreachable.
+	Stats *StatsTracker
 }
 
 // Transport is an http.RoundTripper backed by a single tls-client with
@@ -187,6 +195,16 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		exitIP = t.opts.ExitIPProvider()
 	}
 
+	// Pre-check: block hosts diagnosed as unreachable to avoid
+	// wasting VPN bandwidth on futile requests.
+	if t.opts.Stats != nil {
+		if blocked, diag, rec := t.opts.Stats.ShouldBlock(host); blocked {
+			slog.Warn("stats: blocking request to diagnosed-unreachable host",
+				"host", host, "diagnosis", diag)
+			return blockedResponse(host, diag, rec), nil
+		}
+	}
+
 	// Step 1: proactive cookie stamping.
 	var cachedSol *solver.Solution
 	if t.opts.SolverCache != nil && exitIP != "" {
@@ -201,6 +219,11 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
+	// Record the request outcome for per-host diagnostics.
+	if t.opts.Stats != nil {
+		t.opts.Stats.RecordRequest(host, exitIP, resp.StatusCode)
+	}
+
 	// Step 2: solver path. Only if a solver is configured AND the
 	// response looks like a known challenge AND we haven't already
 	// proactively stamped cached cookies (if we did and it STILL
@@ -209,13 +232,9 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if t.opts.SolverCache != nil && exitIP != "" && cachedSol == nil {
 		kind := solver.DetectChallenge(resp.StatusCode, resp.Header)
 		if kind.Solvable() {
-			// Circuit breaker short-circuit: if previous attempts
-			// on this host have repeatedly failed to satisfy the
-			// WAF after cookie stamping, the circuit is open and
-			// we skip the (expensive) solver entirely. Pass the
-			// challenge response through to the caller as-is.
-			// The circuit auto-closes after the configured
-			// open-for duration.
+			if t.opts.Stats != nil {
+				t.opts.Stats.RecordChallenge(host, exitIP)
+			}
 			if t.opts.SolverCache.CircuitOpen(host) {
 				slog.Warn("solver path: circuit open for host, skipping solver",
 					"host", host, "exit_ip", exitIP, "kind", kind.String(),
@@ -224,43 +243,44 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 				slog.Info("solver path: challenge detected, invoking solver",
 					"host", host, "exit_ip", exitIP, "kind", kind.String(),
 					"status", resp.StatusCode)
-				// Drop the challenge response body, we'll replace it.
+				if t.opts.Stats != nil {
+					t.opts.Stats.RecordSolverInvoked(host)
+				}
 				_ = resp.Body.Close()
 				retryResp, solveErr := t.solveAndRetry(r, host, exitIP)
 				if solveErr != nil {
 					slog.Warn("solver path: solve failed, returning last response",
 						"host", host, "err", solveErr)
+					if t.opts.Stats != nil {
+						t.opts.Stats.RecordSolverError(host)
+					}
 					resp, err = t.dispatch(r)
 					if err != nil {
 						return nil, err
 					}
 				} else {
 					resp = retryResp
-					// If the retry STILL looks challenged, the
-					// cookies didn't satisfy the WAF (most likely
-					// the WAF pins cf_clearance to the solver
-					// browser's TLS fingerprint / socket, not just
-					// the JA4 we match on the fast path). Mark the
-					// failure, invalidate the cache entry, and
-					// pass the 4xx through. After cbThreshold
-					// consecutive failures the circuit opens and
-					// the next request skips the solver entirely.
 					if solver.DetectChallenge(retryResp.StatusCode, retryResp.Header).Solvable() {
 						t.opts.SolverCache.Invalidate(host, exitIP)
 						opened := t.opts.SolverCache.MarkRetryFailed(host)
+						if t.opts.Stats != nil {
+							t.opts.Stats.RecordSolverFailed(host)
+						}
 						if opened {
 							slog.Warn("solver path: circuit breaker OPENED for host — skipping solver for this host until cool-down",
 								"host", host, "exit_ip", exitIP, "status", retryResp.StatusCode)
+							if t.opts.Stats != nil {
+								t.opts.Stats.RecordCircuitOpened(host)
+							}
 						} else {
 							slog.Warn("solver path: retry STILL challenged — invalidating cache, propagating 4xx to caller",
 								"host", host, "exit_ip", exitIP, "status", retryResp.StatusCode)
 						}
 					} else {
-						// Retry cleared the challenge — reset the
-						// host's failure counter so a transient
-						// glitch doesn't count against a healthy
-						// host.
 						t.opts.SolverCache.MarkRetrySucceeded(host)
+						if t.opts.Stats != nil {
+							t.opts.Stats.RecordSolverSuccess(host)
+						}
 					}
 				}
 			}
@@ -272,6 +292,9 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		if fired, reason := t.opts.Rotator.RotateIfTriggered(host, resp.StatusCode, resp.Header); fired {
 			slog.Info("rotation triggered by response heuristic",
 				"status", resp.StatusCode, "host", host, "reason", reason)
+			if t.opts.Stats != nil {
+				t.opts.Stats.RecordRotation(host)
+			}
 		}
 	}
 	return resp, nil
@@ -288,6 +311,26 @@ func (t *Transport) solveAndRetry(orig *http.Request, host, exitIP string) (*htt
 	}
 	stampSolutionCookies(orig, sol)
 	return t.dispatch(orig)
+}
+
+// blockedResponse returns a synthetic 503 for hosts diagnosed as
+// unreachable. Includes machine-readable headers so the caller
+// can detect the block and adjust.
+func blockedResponse(host string, diag Diagnosis, rec string) *http.Response {
+	body := "fauxbrowser: host " + host + " diagnosed as " + string(diag) +
+		" — request blocked to avoid futile VPN traffic. " + rec +
+		"\nReset via DELETE /.internal/stats/" + host
+	return &http.Response{
+		StatusCode: 503,
+		Status:     "503 Service Unavailable",
+		Header: http.Header{
+			"Content-Type":                  {"text/plain; charset=utf-8"},
+			"X-Fauxbrowser-Diagnosis":       {string(diag)},
+			"X-Fauxbrowser-Recommendation":  {rec},
+			"X-Fauxbrowser-Blocked":         {"true"},
+		},
+		Body: io.NopCloser(strings.NewReader(body)),
+	}
 }
 
 // stampSolutionCookies merges the solver's cookies into the

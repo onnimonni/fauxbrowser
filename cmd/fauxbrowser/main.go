@@ -272,6 +272,8 @@ func run() error {
 	}
 	cancel()
 
+	stats := proxy.NewStatsTracker()
+
 	transport, err = proxy.NewTransport(proxy.TransportOptions{
 		Dialer:         rot.Dialer(),
 		TimeoutSeconds: cfg.TimeoutSecs,
@@ -279,6 +281,7 @@ func run() error {
 		Rotator:        rot,
 		SolverCache:    solverCache,
 		ExitIPProvider: func() string { return rot.Stats().CurrentIP },
+		Stats:          stats,
 	})
 	if err != nil {
 		return fmt.Errorf("build transport: %w", err)
@@ -316,7 +319,7 @@ func run() error {
 
 	var adminSrv *http.Server
 	if cfg.AdminListen != "" {
-		adminSrv = startAdmin(cfg.AdminListen, cfg.AdminToken, rot, solverCache)
+		adminSrv = startAdmin(cfg.AdminListen, cfg.AdminToken, rot, solverCache, stats)
 	}
 
 	serverErr := make(chan error, 1)
@@ -360,7 +363,7 @@ func run() error {
 // (not the default, but possible).
 const adminPrefix = "/.internal/"
 
-func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Cache) *http.Server {
+func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Cache, stats *proxy.StatsTracker) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc(adminPrefix+"healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -381,6 +384,48 @@ func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Ca
 			"enabled":      true,
 			"cached_hosts": solverCache.Size(),
 			"circuits":     solverCache.CircuitStatus(),
+		})
+	})
+	// Per-host failure diagnostics. GET returns summary of all hosts
+	// sorted by failure rate. DELETE /.internal/stats/{host} resets
+	// a host's counters (manual override after fixing the cause).
+	mux.HandleFunc(adminPrefix+"stats/", func(w http.ResponseWriter, r *http.Request) {
+		host := strings.TrimPrefix(r.URL.Path, adminPrefix+"stats/")
+		if host == "" {
+			// GET /.internal/stats/ → summary of all hosts
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"hosts": stats.Summary(),
+			})
+			return
+		}
+		if r.Method == http.MethodDelete {
+			stats.ResetHost(host)
+			if solverCache != nil {
+				solverCache.MarkRetrySucceeded(host) // reset circuit breaker too
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		// GET /.internal/stats/{host} → detailed per-IP breakdown
+		detail := stats.HostDetail(host)
+		if detail == nil {
+			http.Error(w, "no stats for host", http.StatusNotFound)
+			return
+		}
+		diag, rec := stats.Diagnose(host)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"host":           detail,
+			"diagnosis":      diag,
+			"recommendation": rec,
+		})
+	})
+	mux.HandleFunc(adminPrefix+"stats", func(w http.ResponseWriter, r *http.Request) {
+		// Redirect /.internal/stats → /.internal/stats/
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"hosts": stats.Summary(),
 		})
 	})
 	mux.HandleFunc(adminPrefix+"rotate", func(w http.ResponseWriter, r *http.Request) {
