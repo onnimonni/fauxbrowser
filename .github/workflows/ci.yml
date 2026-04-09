@@ -14,12 +14,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need tags for check-flake-version.sh fallback mode
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Verify flake.nix version matches most-recent tag
+        # Non-fatal on PR branches where a future version might be in
+        # flake.nix before the tag exists. On main we expect the flake
+        # version to match the latest tag on HEAD.
+        run: |
+          if ./scripts/check-flake-version.sh; then
+            echo "flake version OK"
+          else
+            echo "::warning::flake.nix version doesn't match latest tag — remember to bump on release"
+          fi
 
       - name: go vet
         run: go vet ./...
