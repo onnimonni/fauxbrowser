@@ -360,6 +360,12 @@ func (t *Transport) dispatch(r *http.Request) (*http.Response, error) {
 	}
 
 	egress := scrubOutboundHeaders(r.Header)
+	// Auto-detect Accept-Language from target TLD if the caller
+	// didn't set one. Must run BEFORE applyProfileDefaults so the
+	// soft default ("en-US,en;q=0.9") doesn't fill it first.
+	if egress.Get("Accept-Language") == "" {
+		egress.Set("Accept-Language", AcceptLanguageForHost(r.URL.Hostname()))
+	}
 	egress = applyProfileDefaults(egress, t.profile)
 
 	body := r.Body
