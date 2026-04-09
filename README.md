@@ -5,8 +5,10 @@ Single-binary HTTP proxy for crawlers. Every outbound request:
 1. Egresses through an embedded ProtonVPN WireGuard tunnel (userspace
    wireguard-go + gVisor netstack — no `NET_ADMIN`, no `/dev/net/tun`,
    no root).
-2. Forges a Chrome TLS fingerprint on the wire via
-   [bogdanfinn/tls-client](https://github.com/bogdanfinn/tls-client).
+2. Forges a Chrome 146 TLS fingerprint **captured from a real
+   chromium binary** — bit-exact JA4 match, h2 SETTINGS match,
+   and Chrome's exact header ordering. Verified in CI against
+   nixpkgs chromium on every push.
 3. Rotates the exit IP on `429` or WAF-challenge `403`/`503`
    (Cloudflare, DataDome, Akamai, Sucuri). Rotation is **per-host
    blue/green**: the flagged host's traffic is buffered while a new
@@ -31,10 +33,15 @@ go build -o fauxbrowser ./cmd/fauxbrowser
 # lock to a continent
 ./fauxbrowser -wg-conf /path/to/proton.conf -vpn-continent EU
 
-# with admin listener — GET /.internal/healthz, /.internal/solver, POST /.internal/rotate
+# with admin listener
 ./fauxbrowser -wg-conf /path/to/proton.conf \
   -listen 127.0.0.1:18443 \
   -admin-listen 127.0.0.1:18444
+
+# with cookie persistence across restarts
+./fauxbrowser -wg-conf /path/to/proton.conf \
+  -solver chromedp \
+  -cookie-store /var/lib/fauxbrowser/cookies
 ```
 
 ### Gluetun-compatible env vars
@@ -149,6 +156,8 @@ The flake ships `nixosModules.default` + an overlay:
             enable = true;
             wgConfFile = "/run/secrets/proton-vpn.conf";  # sops-nix / agenix
             vpnCountries = [ "NL" "DE" ];
+            # solver = "chromedp" is default — Chromium auto-pulled
+            # cookie persistence enabled by default at /var/lib/fauxbrowser/cookies
           };
         })
       ];
@@ -165,16 +174,18 @@ empty `CapabilityBoundingSet`, `MemoryDenyWriteExecute=true`,
 
 ```
 -listen                h2c+h1 listen address                       (default 127.0.0.1:18443)
--admin-listen          optional /.internal/{healthz,solver,rotate} (empty = disabled)
+-admin-listen          optional admin API (empty = disabled)
 -wg-conf               path to a wg-quick .conf (REQUIRED)
 -vpn-tier              free (default) | paid | all
 -vpn-country           comma-separated ISO-2 country allow-list
 -vpn-continent         comma-separated continent allow-list        (EU,NA,AS,OC,SA,AF)
 -profile               browser profile                             (default chrome146)
--solver                WAF challenge solver: none (default), chromedp
+-solver                WAF challenge solver: none | chromedp       (NixOS default: chromedp)
 -solver-ttl            cookie cache TTL per (host, exit_ip)        (default 25m)
 -solver-timeout        max time per Chromium solve                 (default 30s)
 -chromium-path         absolute Chromium binary path               (default = $PATH lookup)
+-cookie-store          directory for persisting CF cookies to disk  (empty = in-memory only)
+-allow-version-mismatch  start if chromium major ≠ profile major   (default false)
 -auth-token            bearer token on the proxy listener          (MANDATORY for non-loopback)
 -admin-token           bearer token on the admin listener          (MANDATORY for non-loopback)
 -timeout               per-request upstream timeout, seconds       (default 60)
@@ -248,19 +259,29 @@ module pulls in `pkgs.chromium` automatically when
    solver entirely until the TTL expires or the rotator swaps to
    a new exit IP.
 
-**Known limitation: cross-fingerprint cookie pinning.** A subset of
-CF customers (notably the more aggressive enterprise ones) bind
-`cf_clearance` to the JA3/JA4 TLS fingerprint of whoever solved
-it. Chromium's JA3 ≠ chrome146 tls-client's JA3, so for those
-sites the cookies don't transfer cleanly and the retry still gets
-403. fauxbrowser detects this case, invalidates the cache, and
-propagates the 4xx to the caller without entering an infinite
-loop. For sites where this happens, the solver doesn't help and
-the only solutions are (a) route ALL traffic for that host
-through Chromium directly (heavier, not yet built), or (b) pay
-for residential proxies. The solver IS effective for the larger
-class of sites that pin cookies to `(UA, IP)` only — most smaller
-CF customers, default Bot Fight Mode, etc.
+**Per-host circuit breaker:** if the solver succeeds but the retry
+still gets challenged (cookie binding beyond JA4), fauxbrowser
+counts the failure. After 3 consecutive failures the circuit opens
+for 10 minutes — the solver is skipped and the challenge response
+flows through to the caller. This prevents infinite solve→fail→
+rotate loops. The circuit auto-closes after cool-down.
+
+**Per-host diagnostics:** fauxbrowser tracks every request outcome
+per (host, exitIP) and computes a diagnosis:
+
+| Diagnosis | Meaning | Action |
+|---|---|---|
+| `healthy` | >90% success | None |
+| `solver_handles_it` | challenges seen, solver resolves all | Working |
+| `cookie_binding` | solver fails across 3+ IPs | Needs residential proxy |
+| `ip_reputation_block` | all IPs challenged, none succeed | Needs better exit network |
+| `rate_limited` | >30% 429s | Slow down or add delay |
+| `ip_dependent` | some IPs work, some don't | Rotate until a good one sticks |
+
+When a host is diagnosed as `cookie_binding` or `ip_reputation_block`,
+further requests are pre-rejected with 503 +
+`X-Fauxbrowser-Diagnosis` header to avoid wasting VPN bandwidth.
+Reset via `DELETE /.internal/stats/{host}`.
 
 **Tradeoffs of running the solver**:
 
@@ -268,10 +289,8 @@ CF customers, default Bot Fight Mode, etc.
 - Adds ~500ms-2s latency on the FIRST request to each new
   challenged origin. Subsequent requests are zero-overhead
   (cached cookies).
-- Bypasses the rotator's response heuristic for that retry — the
-  retry hits the same exit IP that just got challenged.
-- Per-host cookie cache survives across requests but is dropped
-  on rotation (cookies are exit-IP-bound).
+- Per-host cookie cache survives across VPN IP rotations and can
+  be persisted to disk via `-cookie-store`.
 
 ## Rotation heuristics
 
@@ -304,13 +323,35 @@ When a rotation is triggered:
 
 ## Cookie policy
 
-- Internal cookie jar persists `Set-Cookie` responses across requests
-  to the same host.
-- On rotation, the jar is cleared so nothing bound to the old exit IP
-  leaks.
-- Caller-supplied `Cookie:` headers on incoming requests are always
-  forwarded verbatim. Those are "the client's cookies" — fauxbrowser
-  only manages its own jar.
+- **Solver cookies** (cf_clearance, _abck, etc.) are cached per
+  `(host, exit_ip)` and **survive VPN IP rotations**. If the pool
+  cycles back to a previously-used IP, cached cookies are ready
+  without re-solving. Cookies are only flushed on CF-specific 403
+  (WAF rejection) or TTL expiry.
+- **`-cookie-store <dir>`**: persists solver cookies to disk as one
+  JSON file per (host, exitIP). Layout:
+  `cookies/www.k-ruoka.fi/185.132.178.104.json`. Loaded on startup,
+  auto-saved on every solve + rotation + shutdown. Solved CF sessions
+  survive process restarts.
+- **tls-client jar** (upstream `Set-Cookie` responses) is cleared on
+  rotation — these are ephemeral session cookies, not CF clearance.
+- **Caller-supplied `Cookie:` headers** on incoming requests are
+  always forwarded verbatim. Those are "the client's cookies" —
+  fauxbrowser only manages its own state.
+
+## Admin API
+
+All endpoints require the `-admin-token` bearer token when bound to
+non-loopback. Available at the `-admin-listen` address.
+
+```
+GET  /.internal/healthz        — rotator stats (exit IP, pool size, rotations)
+GET  /.internal/solver         — solver cache + circuit breaker state per host
+GET  /.internal/stats          — per-host diagnostics sorted by failure rate
+GET  /.internal/stats/{host}   — detailed per-IP breakdown + diagnosis
+DELETE /.internal/stats/{host} — reset counters + circuit breaker (retry after fix)
+POST /.internal/rotate         — force immediate VPN IP rotation
+```
 
 ## Architecture
 
@@ -340,13 +381,20 @@ When a rotation is triggered:
 go test -race ./...
 ```
 
+CI also runs a **JA4 TLS fingerprint drift test** on Linux with
+nixpkgs chromium — verifies our captured spec still matches the
+real binary on the wire.
+
 Coverage:
 - `internal/proton`: catalog + pool, country/continent/tier filtering.
 - `internal/rotator`: heuristic matrix + blue/green state machine
   (happy path, host quarantine, debounce, drain, concurrent burst).
 - `internal/wgtunnel`: wg-quick parsing, `WithPeer` clone.
 - `internal/proxy`: h2c multiplexing, header scrub, bearer auth,
-  profile coherence invariant.
+  profile coherence, Chrome header order, per-host diagnostics.
+- `internal/solver`: cache TTL, singleflight dedup, circuit breaker
+  state machine, cookie disk persistence round-trip.
+- `internal/proxy/fingerprints`: captured ClientHello loads cleanly.
 
 ## Credits
 
