@@ -186,8 +186,12 @@ in
       default = "/var/lib/fauxbrowser/cookies";
       description = ''
         Directory for persisting the solver's CF cookie cache to disk.
-        One JSON file per (host, exitIP) pair — O(1) per-entry writes,
-        crash-safe, and inspectable via ls/cat.
+        Hostname-partitioned layout:
+
+            /var/lib/fauxbrowser/cookies/www.k-ruoka.fi/185.132.178.104.json
+
+        One file per (host, exitIP) — O(1) per-entry writes, crash-safe,
+        inspectable via `ls` / `cat`. Expired files are cleaned on startup.
 
         Cookies auto-persist on every solve and are restored on startup.
         Solved CF sessions survive process restarts without re-solving.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -224,6 +225,46 @@ func TestCacheSaveAndLoad(t *testing.T) {
 	}
 	if sol.Cookie("cf_clearance") != "abc123" {
 		t.Errorf("cf_clearance = %q, want abc123", sol.Cookie("cf_clearance"))
+	}
+}
+
+func TestCacheDirLayout(t *testing.T) {
+	stub := &stubSolver{
+		cookies: []*http.Cookie{{Name: "cf_clearance", Value: "v1"}},
+	}
+	c := NewCache(stub, 1*time.Hour)
+	target1, _ := url.Parse("https://www.k-ruoka.fi/")
+	target2, _ := url.Parse("https://example.com/")
+
+	_, _ = c.LookupOrSolve(context.Background(), target1, "1.2.3.4")
+	_, _ = c.LookupOrSolve(context.Background(), target2, "5.6.7.8")
+
+	dir := t.TempDir()
+	if err := c.SaveToDir(dir); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Verify hostname-partitioned directory layout:
+	//   {dir}/www.k-ruoka.fi/1.2.3.4.json
+	//   {dir}/example.com/5.6.7.8.json
+	for _, want := range []string{
+		"www.k-ruoka.fi/1.2.3.4.json",
+		"example.com/5.6.7.8.json",
+	} {
+		full := dir + "/" + want
+		if _, err := os.Stat(full); err != nil {
+			t.Errorf("expected file %s, got error: %v", want, err)
+		}
+	}
+
+	// Verify round-trip load.
+	c2 := NewCache(stub, 1*time.Hour)
+	loaded, err := c2.LoadFromDir(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded != 2 {
+		t.Errorf("loaded %d, want 2", loaded)
 	}
 }
 
