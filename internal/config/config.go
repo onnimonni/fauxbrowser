@@ -45,6 +45,17 @@ type Config struct {
 	SolverTimeout  time.Duration // per-solve browser deadline (default 30s)
 	ChromiumPath   string        // override Chromium binary path (default = $PATH lookup)
 
+	// AllowVersionMismatch permits fauxbrowser to start when the
+	// chromedp solver's Chromium binary has a Chrome major version
+	// that disagrees with the active tls-client profile (or has no
+	// matching profile at all). False by default — a mismatch means
+	// the solver's ClientHello and the fast path's ClientHello use
+	// different JA3/JA4 fingerprints, which breaks cookie portability
+	// for WAFs that pin cf_clearance to the solving TLS fingerprint.
+	// Intended escape hatch for "chromium just got bumped to N+1 and
+	// bogdanfinn/tls-client hasn't shipped chromeN+1 yet".
+	AllowVersionMismatch bool
+
 	TimeoutSecs   int
 	CooldownSecs  int           // taint cooldown per server after 429/403
 	HandshakeWait time.Duration // handshake observation window per rotation attempt
@@ -134,6 +145,12 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("FAUXBROWSER_CHROMIUM_PATH"); v != "" {
 		c.ChromiumPath = v
+	}
+	if v := strings.ToLower(os.Getenv("FAUXBROWSER_ALLOW_VERSION_MISMATCH")); v != "" {
+		switch v {
+		case "1", "true", "yes", "on":
+			c.AllowVersionMismatch = true
+		}
 	}
 	if v := os.Getenv("FAUXBROWSER_VPN_COUNTRIES"); v != "" {
 		c.VPNCountries = SplitCSV(v)

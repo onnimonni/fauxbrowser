@@ -107,6 +107,22 @@ func SelectProfile(name string) BrowserProfile {
 	return p
 }
 
+// SelectProfileForMajor returns the profile entry whose Major matches
+// the given Chrome major version, plus ok=true. When no profile in the
+// table matches, returns the zero BrowserProfile and ok=false.
+//
+// Used by fauxbrowser to auto-align the tls-client fingerprint with
+// whatever Chromium the chromedp solver is going to launch — so both
+// paths present the same Chrome major version to the origin.
+func SelectProfileForMajor(major int) (BrowserProfile, bool) {
+	for _, p := range profileTable {
+		if p.Major == major {
+			return p, true
+		}
+	}
+	return BrowserProfile{}, false
+}
+
 // KnownProfiles returns the sorted list of profile names.
 func KnownProfiles() []string {
 	out := make([]string, 0, len(profileTable))
