@@ -42,3 +42,44 @@ jobs:
 
       - name: go build
         run: go build ./...
+
+  tls-fingerprint:
+    # Cross-check that nixpkgs chromium and bogdanfinn/tls-client's
+    # Chrome_NNN profile emit the same JA4 on the wire. Catches
+    # drift BEFORE it reaches production, where it manifests as
+    # cross-client cookie portability failures on JA4-pinning WAFs.
+    # Linux-only because nixpkgs chromium is Linux-only.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve flake-pinned chromium store path
+        id: chromium
+        # Use the flake-pinned nixpkgs so the test runs against THE
+        # chromium a production deploy will ship — not whatever is in
+        # ubuntu-latest's apt repo.
+        run: |
+          path=$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#chromium)
+          echo "bin=$path/bin" >> "$GITHUB_OUTPUT"
+          echo "$path/bin" >> "$GITHUB_PATH"
+
+      - name: Verify chromium on PATH
+        run: chromium --version
+
+      - name: go test -tags tls_fingerprint_ci
+        # Fails the job on JA4 drift between tls-client's Chrome_NNN
+        # snapshot and real chromium NNN. Also fails on chromium major
+        # not matching DefaultProfile.
+        run: go test -tags tls_fingerprint_ci -run TestJA4 -count=1 -v ./internal/proxy/...
