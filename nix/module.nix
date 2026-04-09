@@ -46,6 +46,7 @@ let
       ++ lib.optional (cfg.solver != "none") "FAUXBROWSER_SOLVER_TTL=${cfg.solverTtl}"
       ++ lib.optional (cfg.solver != "none") "FAUXBROWSER_SOLVER_TIMEOUT=${cfg.solverTimeout}"
       ++ lib.optional (cfg.solver == "chromedp") "FAUXBROWSER_CHROMIUM_PATH=${cfg.chromiumPackage}/bin/chromium"
+      ++ lib.optional (cfg.solver != "none" && cfg.cookieStorePath != null) "FAUXBROWSER_COOKIE_STORE=${cfg.cookieStorePath}"
       ++ [ "" ]  # trailing newline
     )
   );
@@ -128,20 +129,23 @@ in
 
     solver = lib.mkOption {
       type = lib.types.enum [ "none" "chromedp" ];
-      default = "none";
+      default = "chromedp";
       description = ''
-        WAF challenge solver. `none` (default) keeps fauxbrowser as
-        a single self-contained binary with no Chromium dependency.
-        `chromedp` enables on-demand headless Chromium spawning to
-        solve Cloudflare/Akamai/DataDome/PerimeterX JavaScript
-        challenges; the resulting clearance cookies are cached per
-        (host, exit_ip) and reused on subsequent fauxbrowser
-        requests until rotation or TTL expiry.
+        WAF challenge solver. `chromedp` (default) enables on-demand
+        headless Chromium spawning to solve Cloudflare/Akamai/DataDome/
+        PerimeterX JavaScript challenges; resulting clearance cookies
+        are cached per (host, exit_ip) and reused on subsequent
+        requests. Cookies survive VPN IP rotations and can optionally
+        be persisted to disk via `cookieStorePath`.
 
         Setting this to `chromedp` automatically adds `pkgs.chromium`
         to the systemd unit's PATH and tweaks the sandbox to allow
         Chromium to spawn its sandbox helpers (Chromium needs to
         fork and create user namespaces).
+
+        Set to `none` to disable the solver entirely — fauxbrowser
+        stays a single self-contained binary with no Chromium
+        dependency. Useful for targets that don't use WAF challenges.
       '';
     };
 
@@ -163,8 +167,8 @@ in
       default = "25m";
       description = ''
         How long to cache a (host, exit_ip) cookie bundle before
-        re-running the solver. Cookies are also dropped on every
-        rotation regardless of this value.
+        re-running the solver. Cookies survive VPN IP rotations
+        and are only flushed on CF-specific 403 or TTL expiry.
       '';
     };
 
@@ -174,6 +178,20 @@ in
       description = ''
         Max time per Chromium solve (startup + navigation +
         challenge wait + cookie extraction).
+      '';
+    };
+
+    cookieStorePath = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "/var/lib/fauxbrowser/cookies.json";
+      description = ''
+        File path for persisting the solver's CF cookie cache to
+        disk. Cookies are saved on every VPN rotation and on clean
+        shutdown, and restored on startup — so solved CF sessions
+        survive process restarts without re-solving.
+
+        Set to `null` to disable disk persistence (in-memory only).
+        Ignored when `solver = "none"`.
       '';
     };
 
@@ -262,6 +280,11 @@ in
         # Runtime directory for the merged env file the script writes.
         RuntimeDirectory = "fauxbrowser";
         RuntimeDirectoryMode = "0750";
+
+        # State directory for cookie persistence (/var/lib/fauxbrowser).
+        # Survives service restarts; cleared only on explicit deletion.
+        StateDirectory = "fauxbrowser";
+        StateDirectoryMode = "0750";
 
         # DynamicUser with no shell, no home. Userspace WireGuard
         # means we do NOT need CAP_NET_ADMIN.
