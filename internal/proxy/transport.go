@@ -209,33 +209,59 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if t.opts.SolverCache != nil && exitIP != "" && cachedSol == nil {
 		kind := solver.DetectChallenge(resp.StatusCode, resp.Header)
 		if kind.Solvable() {
-			slog.Info("solver path: challenge detected, invoking solver",
-				"host", host, "exit_ip", exitIP, "kind", kind.String(),
-				"status", resp.StatusCode)
-			// Drop the challenge response body, we'll replace it.
-			_ = resp.Body.Close()
-			retryResp, solveErr := t.solveAndRetry(r, host, exitIP)
-			if solveErr != nil {
-				slog.Warn("solver path: solve failed, returning last response",
-					"host", host, "err", solveErr)
-				resp, err = t.dispatch(r)
-				if err != nil {
-					return nil, err
-				}
+			// Circuit breaker short-circuit: if previous attempts
+			// on this host have repeatedly failed to satisfy the
+			// WAF after cookie stamping, the circuit is open and
+			// we skip the (expensive) solver entirely. Pass the
+			// challenge response through to the caller as-is.
+			// The circuit auto-closes after the configured
+			// open-for duration.
+			if t.opts.SolverCache.CircuitOpen(host) {
+				slog.Warn("solver path: circuit open for host, skipping solver",
+					"host", host, "exit_ip", exitIP, "kind", kind.String(),
+					"status", resp.StatusCode)
 			} else {
-				resp = retryResp
-				// Circuit breaker: if the retry STILL looks
-				// challenged, the cookies didn't satisfy the WAF
-				// (most likely the WAF pins cf_clearance to the
-				// solver browser's TLS fingerprint, which doesn't
-				// match the chrome146 we use on the fast path).
-				// Invalidate the cache so we don't keep stamping
-				// the same useless cookies, and pass the 4xx
-				// through to the caller.
-				if solver.DetectChallenge(retryResp.StatusCode, retryResp.Header).Solvable() {
-					slog.Warn("solver path: retry STILL challenged — invalidating cache, propagating 4xx to caller",
-						"host", host, "exit_ip", exitIP, "status", retryResp.StatusCode)
-					t.opts.SolverCache.Invalidate(host, exitIP)
+				slog.Info("solver path: challenge detected, invoking solver",
+					"host", host, "exit_ip", exitIP, "kind", kind.String(),
+					"status", resp.StatusCode)
+				// Drop the challenge response body, we'll replace it.
+				_ = resp.Body.Close()
+				retryResp, solveErr := t.solveAndRetry(r, host, exitIP)
+				if solveErr != nil {
+					slog.Warn("solver path: solve failed, returning last response",
+						"host", host, "err", solveErr)
+					resp, err = t.dispatch(r)
+					if err != nil {
+						return nil, err
+					}
+				} else {
+					resp = retryResp
+					// If the retry STILL looks challenged, the
+					// cookies didn't satisfy the WAF (most likely
+					// the WAF pins cf_clearance to the solver
+					// browser's TLS fingerprint / socket, not just
+					// the JA4 we match on the fast path). Mark the
+					// failure, invalidate the cache entry, and
+					// pass the 4xx through. After cbThreshold
+					// consecutive failures the circuit opens and
+					// the next request skips the solver entirely.
+					if solver.DetectChallenge(retryResp.StatusCode, retryResp.Header).Solvable() {
+						t.opts.SolverCache.Invalidate(host, exitIP)
+						opened := t.opts.SolverCache.MarkRetryFailed(host)
+						if opened {
+							slog.Warn("solver path: circuit breaker OPENED for host — skipping solver for this host until cool-down",
+								"host", host, "exit_ip", exitIP, "status", retryResp.StatusCode)
+						} else {
+							slog.Warn("solver path: retry STILL challenged — invalidating cache, propagating 4xx to caller",
+								"host", host, "exit_ip", exitIP, "status", retryResp.StatusCode)
+						}
+					} else {
+						// Retry cleared the challenge — reset the
+						// host's failure counter so a transient
+						// glitch doesn't count against a healthy
+						// host.
+						t.opts.SolverCache.MarkRetrySucceeded(host)
+					}
 				}
 			}
 		}

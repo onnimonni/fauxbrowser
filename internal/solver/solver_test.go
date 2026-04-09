@@ -179,3 +179,125 @@ func TestCacheSolveErrorNotCached(t *testing.T) {
 		t.Errorf("solver called %d times, want 2 (no cache on error)", got)
 	}
 }
+
+// --- circuit breaker ---
+
+func TestCircuitBreakerClosedInitially(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	if c.CircuitOpen("example.com") {
+		t.Error("fresh cache should have closed circuit for all hosts")
+	}
+}
+
+func TestCircuitBreakerOpensAfterThreshold(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(3, 10*time.Minute)
+
+	// First two failures don't open.
+	if opened := c.MarkRetryFailed("bad.host"); opened {
+		t.Error("failure 1 should not open circuit")
+	}
+	if c.CircuitOpen("bad.host") {
+		t.Error("circuit should still be closed after 1 failure")
+	}
+	if opened := c.MarkRetryFailed("bad.host"); opened {
+		t.Error("failure 2 should not open circuit")
+	}
+	if c.CircuitOpen("bad.host") {
+		t.Error("circuit should still be closed after 2 failures")
+	}
+	// Third failure opens.
+	if opened := c.MarkRetryFailed("bad.host"); !opened {
+		t.Error("failure 3 should open circuit")
+	}
+	if !c.CircuitOpen("bad.host") {
+		t.Error("circuit should be open after 3 failures")
+	}
+}
+
+func TestCircuitBreakerIsolatesHosts(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(2, 10*time.Minute)
+
+	c.MarkRetryFailed("bad.host")
+	c.MarkRetryFailed("bad.host")
+	if !c.CircuitOpen("bad.host") {
+		t.Error("bad.host should be open")
+	}
+	if c.CircuitOpen("good.host") {
+		t.Error("good.host should not be affected by bad.host's circuit")
+	}
+}
+
+func TestCircuitBreakerSuccessResets(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(3, 10*time.Minute)
+
+	c.MarkRetryFailed("flaky.host")
+	c.MarkRetryFailed("flaky.host")
+	// One away from opening.
+	c.MarkRetrySucceeded("flaky.host")
+	// Now three more failures should be needed to open again.
+	c.MarkRetryFailed("flaky.host")
+	c.MarkRetryFailed("flaky.host")
+	if c.CircuitOpen("flaky.host") {
+		t.Error("circuit should NOT be open after success reset + 2 new failures")
+	}
+	if opened := c.MarkRetryFailed("flaky.host"); !opened {
+		t.Error("third new failure after reset should open circuit")
+	}
+}
+
+func TestCircuitBreakerAutoCloses(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(2, 10*time.Minute)
+
+	// Inject fake clock.
+	now := time.Unix(1_000_000, 0)
+	c.nowFn = func() time.Time { return now }
+
+	c.MarkRetryFailed("pinned.host")
+	c.MarkRetryFailed("pinned.host")
+	if !c.CircuitOpen("pinned.host") {
+		t.Fatal("expected circuit open")
+	}
+
+	// Advance clock past open duration.
+	now = now.Add(11 * time.Minute)
+	if c.CircuitOpen("pinned.host") {
+		t.Error("circuit should auto-close after open duration elapses")
+	}
+
+	// The auto-close also resets the counter — one failure alone
+	// should not re-open.
+	c.MarkRetryFailed("pinned.host")
+	if c.CircuitOpen("pinned.host") {
+		t.Error("circuit should not reopen on first failure after auto-close")
+	}
+}
+
+func TestCircuitBreakerStatus(t *testing.T) {
+	c := NewCache(&stubSolver{}, 5*time.Minute)
+	c.SetCircuitBreakerTuning(2, 10*time.Minute)
+
+	c.MarkRetryFailed("bad.host")
+	c.MarkRetryFailed("bad.host")
+	c.MarkRetryFailed("flaky.host")
+
+	status := c.CircuitStatus()
+	if len(status) != 2 {
+		t.Errorf("status has %d entries, want 2", len(status))
+	}
+	if !status["bad.host"].Open {
+		t.Error("bad.host should be Open=true")
+	}
+	if status["bad.host"].ConsecutiveFailures != 2 {
+		t.Errorf("bad.host failures = %d, want 2", status["bad.host"].ConsecutiveFailures)
+	}
+	if status["flaky.host"].Open {
+		t.Error("flaky.host should be Open=false")
+	}
+	if status["flaky.host"].ConsecutiveFailures != 1 {
+		t.Errorf("flaky.host failures = %d, want 1", status["flaky.host"].ConsecutiveFailures)
+	}
+}

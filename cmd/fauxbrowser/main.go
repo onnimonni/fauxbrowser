@@ -300,7 +300,7 @@ func run() error {
 
 	var adminSrv *http.Server
 	if cfg.AdminListen != "" {
-		adminSrv = startAdmin(cfg.AdminListen, cfg.AdminToken, rot)
+		adminSrv = startAdmin(cfg.AdminListen, cfg.AdminToken, rot, solverCache)
 	}
 
 	serverErr := make(chan error, 1)
@@ -328,11 +328,28 @@ func run() error {
 	return nil
 }
 
-func startAdmin(addr, token string, rot *rotator.Rotator) *http.Server {
+func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Cache) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(rot.Stats())
+	})
+	// /solver exposes the per-host solver circuit-breaker state.
+	// Open circuits indicate hosts where repeated solve-then-retry
+	// still got challenged — likely WAF cookie pinning. Useful for
+	// debugging "why is my request failing" without reading server
+	// logs.
+	mux.HandleFunc("/solver", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if solverCache == nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"enabled": false})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled":      true,
+			"cached_hosts": solverCache.Size(),
+			"circuits":     solverCache.CircuitStatus(),
+		})
 	})
 	mux.HandleFunc("/rotate", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
