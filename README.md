@@ -174,6 +174,43 @@ empty `CapabilityBoundingSet`, `MemoryDenyWriteExecute=true`,
 tls-client's root pool so upstream HTTPS verification keeps working
 inside hardened systemd sandboxes.
 
+If you prefer gluetun-style env vars instead of a prebuilt `wg-quick`
+config, the NixOS module can load one or more dotenv files directly:
+
+```nix
+{
+  modules = [
+    fauxbrowser.nixosModules.default
+    ({ config, ... }: {
+      services.fauxbrowser = {
+        enable = true;
+        environmentFiles = [ config.sops.secrets.fauxbrowser-env.path ];
+        listen = "127.0.0.1:18443";
+        adminListen = "127.0.0.1:18444";
+      };
+
+      sops.secrets.fauxbrowser-env = {
+        format = "dotenv";
+        sopsFile = ./secrets/fauxbrowser.env;
+      };
+    })
+  ];
+}
+```
+
+Example dotenv contents:
+
+```dotenv
+WIREGUARD_PRIVATE_KEY=base64-private-key
+SERVER_COUNTRIES=Netherlands,Germany
+FREE_ONLY=on
+```
+
+`environmentFiles` is loaded before the module-generated
+`FAUXBROWSER_*` values, so explicit NixOS options still override
+same-name entries. If you use gluetun aliases like `SERVER_COUNTRIES`,
+avoid setting the corresponding NixOS option at the same time.
+
 ### Custom NixOS / systemd deployments
 
 If you use `fauxbrowser.nixosModules.default`, you do not need any extra

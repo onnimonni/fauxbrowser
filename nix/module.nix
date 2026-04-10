@@ -29,10 +29,11 @@ let
   # resolves to the Go build output for the host system.
   pkg = cfg.package;
 
-  # EnvironmentFile written at activation time carrying only the non-
-  # secret configuration. Secrets (auth tokens) live in a separate
-  # file so they can be sops/agenix-managed.
-  envFile = pkgs.writeText "fauxbrowser.env" (
+  # EnvironmentFile written at activation time carrying the module's
+  # non-secret configuration. Operators can layer additional env files
+  # via services.fauxbrowser.environmentFiles, e.g. a sops-managed
+  # dotenv with gluetun-compatible WireGuard variables.
+  moduleEnvFile = pkgs.writeText "fauxbrowser.env" (
     lib.concatStringsSep "\n" (
       lib.optional (cfg.listen != null) "FAUXBROWSER_LISTEN=${cfg.listen}"
       ++ lib.optional (cfg.adminListen != null) "FAUXBROWSER_ADMIN_LISTEN=${cfg.adminListen}"
@@ -84,7 +85,8 @@ in
     };
 
     wgConfFile = lib.mkOption {
-      type = lib.types.path;
+      type = lib.types.nullOr lib.types.path;
+      default = null;
       description = ''
         Path to a WireGuard .conf (wg-quick format) holding a ProtonVPN
         client private key + interface address + DNS. The [Peer] section
@@ -94,6 +96,22 @@ in
         commit it to the Nix store.
       '';
       example = "/run/secrets/proton-vpn.conf";
+    };
+
+    environmentFiles = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [];
+      example = [ "/run/secrets/fauxbrowser.env" ];
+      description = ''
+        Additional systemd EnvironmentFile fragments loaded before the
+        module-generated fauxbrowser env. Useful with sops-nix or agenix
+        managed dotenv files, including gluetun-compatible aliases such
+        as `WIREGUARD_PRIVATE_KEY`, `SERVER_COUNTRIES`, and `FREE_ONLY`.
+
+        When `wgConfFile` is unset, one of these files must provide
+        `FAUXBROWSER_WG_PRIVATE_KEY`, `WIREGUARD_PRIVATE_KEY`, or
+        `FAUXBROWSER_WG_CONF`.
+      '';
     };
 
     vpnTier = lib.mkOption {
@@ -249,24 +267,19 @@ in
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      # Non-secret env vars go into a Nix-store file. Secrets
-      # (auth tokens) are loaded from the user-provided paths via
-      # systemd's LoadCredential machinery, which puts them under
-      # $CREDENTIALS_DIRECTORY/<id>. A small ExecStartPre then writes
-      # the values into a runtime-only env file read by the service.
+      # Non-secret env vars are loaded via EnvironmentFile. Secrets
+      # (auth tokens) are loaded from user-provided files via
+      # systemd's LoadCredential machinery, then exported immediately
+      # before exec so they never land in the Nix store.
       script = ''
         set -eu
 
-        RUNTIME_ENV="''${RUNTIME_DIRECTORY}/env"
-        : > "$RUNTIME_ENV"
-        cat "${envFile}" >> "$RUNTIME_ENV"
-
         if [ -n "''${CREDENTIALS_DIRECTORY:-}" ]; then
           if [ -f "$CREDENTIALS_DIRECTORY/auth-token" ]; then
-            printf 'FAUXBROWSER_AUTH_TOKEN=%s\n' "$(cat "$CREDENTIALS_DIRECTORY/auth-token")" >> "$RUNTIME_ENV"
+            export FAUXBROWSER_AUTH_TOKEN="$(cat "$CREDENTIALS_DIRECTORY/auth-token")"
           fi
           if [ -f "$CREDENTIALS_DIRECTORY/admin-token" ]; then
-            printf 'FAUXBROWSER_ADMIN_TOKEN=%s\n' "$(cat "$CREDENTIALS_DIRECTORY/admin-token")" >> "$RUNTIME_ENV"
+            export FAUXBROWSER_ADMIN_TOKEN="$(cat "$CREDENTIALS_DIRECTORY/admin-token")"
           fi
         fi
 
@@ -286,12 +299,9 @@ in
           lib.optional (cfg.authTokenFile != null) "auth-token:${toString cfg.authTokenFile}"
           ++ lib.optional (cfg.adminTokenFile != null) "admin-token:${toString cfg.adminTokenFile}";
 
-        # Non-secret env (listen, wg-conf path, vpn filters).
-        EnvironmentFile = envFile;
-
-        # Runtime directory for the merged env file the script writes.
-        RuntimeDirectory = "fauxbrowser";
-        RuntimeDirectoryMode = "0750";
+        # User-supplied env files load first; module-generated
+        # FAUXBROWSER_* vars load last and override same-name entries.
+        EnvironmentFile = cfg.environmentFiles ++ [ moduleEnvFile ];
 
         # State directory for cookie persistence (/var/lib/fauxbrowser).
         # Survives service restarts; cleared only on explicit deletion.
@@ -363,8 +373,12 @@ in
 
     assertions = [
       {
-        assertion = cfg.wgConfFile != null;
-        message = "services.fauxbrowser.wgConfFile is required.";
+        assertion = cfg.wgConfFile != null || cfg.environmentFiles != [];
+        message = ''
+          services.fauxbrowser requires either wgConfFile or environmentFiles
+          providing FAUXBROWSER_WG_CONF, FAUXBROWSER_WG_PRIVATE_KEY, or
+          WIREGUARD_PRIVATE_KEY.
+        '';
       }
     ];
   };
