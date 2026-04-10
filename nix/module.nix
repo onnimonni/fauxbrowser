@@ -274,6 +274,12 @@ in
       '';
 
       serviceConfig = {
+        Environment = [
+          "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+          "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+          "SSL_CERT_DIR=${pkgs.cacert}/etc/ssl/certs"
+        ];
+
         # Secrets loaded out-of-band; referenced by the ExecStartPre
         # script above via $CREDENTIALS_DIRECTORY.
         LoadCredential =

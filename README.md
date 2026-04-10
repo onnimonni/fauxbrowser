@@ -168,7 +168,33 @@ The flake ships `nixosModules.default` + an overlay:
 
 The systemd unit is hardened (`DynamicUser=true`, `ProtectSystem=strict`,
 empty `CapabilityBoundingSet`, `MemoryDenyWriteExecute=true`,
-`LoadCredential` for secret tokens).
+`LoadCredential` for secret tokens). The NixOS module also exports
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, and `NIX_SSL_CERT_FILE` from
+`pkgs.cacert`, and fauxbrowser loads those paths explicitly into
+tls-client's root pool so upstream HTTPS verification keeps working
+inside hardened systemd sandboxes.
+
+### Custom NixOS / systemd deployments
+
+If you use `fauxbrowser.nixosModules.default`, you do not need any extra
+CA-bundle wiring. The module already exports the right variables.
+
+If you run the fauxbrowser binary from your own NixOS module, service,
+or flake output, export the CA bundle from `pkgs.cacert` so fauxbrowser
+can load it into tls-client explicitly:
+
+```nix
+systemd.services.fauxbrowser.serviceConfig.Environment = [
+  "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+  "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+  "SSL_CERT_DIR=${pkgs.cacert}/etc/ssl/certs"
+];
+```
+
+Without one of those variables, fauxbrowser falls back to the ambient
+system trust store. On hardened NixOS/systemd deployments that can be
+missing or incomplete, which leads to upstream HTTPS failures like
+`x509: certificate signed by unknown authority`.
 
 ## Flags
 

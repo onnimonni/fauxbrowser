@@ -22,6 +22,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log/slog"
@@ -50,6 +51,12 @@ type TransportOptions struct {
 	// Dialer routes outbound TCP through the WireGuard tunnel. Must be
 	// non-nil — fauxbrowser has no bare-metal fallback.
 	Dialer proxy.ContextDialer
+
+	// RootCAs optionally overrides the root pool used for upstream TLS
+	// verification. Nil keeps the platform default unless CA-bundle
+	// environment variables are set, in which case fauxbrowser builds
+	// an explicit pool from those paths and passes it to tls-client.
+	RootCAs *x509.CertPool
 
 	// TimeoutSeconds is the per-request upstream timeout.
 	TimeoutSeconds int
@@ -110,6 +117,19 @@ func NewTransport(opts TransportOptions) (*Transport, error) {
 	if opts.TimeoutSeconds <= 0 {
 		opts.TimeoutSeconds = 60
 	}
+	if opts.RootCAs == nil {
+		roots, sources, err := loadRootCAsFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		if roots != nil {
+			opts.RootCAs = roots
+		}
+		if len(sources) > 0 {
+			slog.Info("transport: loaded explicit CA roots from environment",
+				"sources", strings.Join(sources, ", "))
+		}
+	}
 	t := &Transport{
 		opts:    opts,
 		profile: SelectProfile(opts.Profile),
@@ -143,6 +163,11 @@ func (t *Transport) rebuildClient() error {
 		) (proxy.ContextDialer, error) {
 			return t.opts.Dialer, nil
 		}),
+	}
+	if t.opts.RootCAs != nil {
+		opts = append(opts, tls_client.WithTransportOptions(&tls_client.TransportOptions{
+			RootCAs: t.opts.RootCAs,
+		}))
 	}
 	c, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
 	if err != nil {
@@ -324,10 +349,10 @@ func blockedResponse(host string, diag Diagnosis, rec string) *http.Response {
 		StatusCode: 503,
 		Status:     "503 Service Unavailable",
 		Header: http.Header{
-			"Content-Type":                  {"text/plain; charset=utf-8"},
-			"X-Fauxbrowser-Diagnosis":       {string(diag)},
-			"X-Fauxbrowser-Recommendation":  {rec},
-			"X-Fauxbrowser-Blocked":         {"true"},
+			"Content-Type":                 {"text/plain; charset=utf-8"},
+			"X-Fauxbrowser-Diagnosis":      {string(diag)},
+			"X-Fauxbrowser-Recommendation": {rec},
+			"X-Fauxbrowser-Blocked":        {"true"},
 		},
 		Body: io.NopCloser(strings.NewReader(body)),
 	}
@@ -519,4 +544,3 @@ func cloneHeader(h http.Header) http.Header {
 	}
 	return out
 }
-
