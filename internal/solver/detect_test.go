@@ -39,6 +39,25 @@ func TestDetectChallenge(t *testing.T) {
 		{"vercel x-vercel-challenge-token", 429, http.Header{"X-Vercel-Challenge-Token": {"2.1776149.abc"}}, VercelChallenge},
 		{"vercel server 429", 429, http.Header{"Server": {"Vercel"}}, VercelChallenge},
 		{"vercel server 200 — not challenge", 200, http.Header{"Server": {"Vercel"}}, NotChallenged},
+
+		// Anubis: detected via Set-Cookie suffix regardless of status code.
+		// Cookie name is "<domain>-anubis-cookie-verification=<uuid>".
+		{"anubis 200 verification cookie", 200, http.Header{
+			"Set-Cookie": {"techaro.lol-anubis-cookie-verification=019d8af4-4e4c-7db0-b310-9569b0eb27a8; Path=/; Secure"},
+		}, AnubisChallenge},
+		{"anubis different domain prefix", 200, http.Header{
+			"Set-Cookie": {"nixpk.gs-anubis-cookie-verification=abc123; Path=/"},
+		}, AnubisChallenge},
+		{"anubis not triggered by plain 200", 200, http.Header{"Server": {"nginx"}}, NotChallenged},
+		{"anubis cleared auth cookie alone is not a signal", 200, http.Header{
+			"Set-Cookie": {"techaro.lol-anubis-auth=; Max-Age=0; Path=/"},
+		}, NotChallenged},
+
+		// Kasada: x-kpsdk-* headers (any one is sufficient).
+		{"kasada x-kpsdk-ct", 429, http.Header{"X-Kpsdk-Ct": {"abc"}}, KasadaChallenge},
+		{"kasada x-kpsdk-r", 429, http.Header{"X-Kpsdk-R": {"def"}}, KasadaChallenge},
+		{"kasada x-kpsdk-sc", 200, http.Header{"X-Kpsdk-Sc": {"1"}}, KasadaChallenge},
+		{"kasada plain 429 no kpsdk", 429, http.Header{}, NotChallenged},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -60,7 +79,8 @@ func TestChallengeKindSolvable(t *testing.T) {
 			t.Errorf("%v should be solvable", k)
 		}
 	}
-	notSolvable := []ChallengeKind{NotChallenged, SucuriChallenge}
+	solvable = append(solvable, AnubisChallenge)
+	notSolvable := []ChallengeKind{NotChallenged, SucuriChallenge, KasadaChallenge}
 	for _, k := range notSolvable {
 		if k.Solvable() {
 			t.Errorf("%v should NOT be solvable (header-only)", k)

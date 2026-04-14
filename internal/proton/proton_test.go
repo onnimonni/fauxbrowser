@@ -158,8 +158,10 @@ func TestPoolNextCyclesAndTaints(t *testing.T) {
 	}
 	now := int64(1000)
 	p := NewPool(servers, 10, func() int64 { return now })
+	// With equal weights, all 3 servers must appear within 100 iterations
+	// (probability of missing any one is (2/3)^100 ≈ 2e-18 — negligible).
 	seen := map[string]int{}
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 100; i++ {
 		s, ok := p.Next()
 		if !ok {
 			t.Fatalf("Next returned !ok on iteration %d", i)
@@ -167,7 +169,7 @@ func TestPoolNextCyclesAndTaints(t *testing.T) {
 		seen[s.Name]++
 	}
 	if len(seen) != 3 {
-		t.Errorf("expected to see all 3 servers in 6 iterations: %+v", seen)
+		t.Errorf("expected to see all 3 servers in 100 iterations: %+v", seen)
 	}
 	// Taint A + B, only C should come out.
 	p.Taint("1.1.1.1")
@@ -195,6 +197,64 @@ func TestPoolNextCyclesAndTaints(t *testing.T) {
 	_ = s
 	if p.Available() != 3 {
 		t.Errorf("Available = %d, want 3", p.Available())
+	}
+}
+
+func TestPoolScoreWeighting(t *testing.T) {
+	// A has been repeatedly blocked, B is neutral, C has good history.
+	// After many Next() calls C should be picked most often, A least.
+	servers := []Server{
+		{Name: "A", EntryIP: "1.1.1.1", Pubkey: "a"},
+		{Name: "B", EntryIP: "2.2.2.2", Pubkey: "b"},
+		{Name: "C", EntryIP: "3.3.3.3", Pubkey: "c"},
+	}
+	p := NewPool(servers, 10, nil)
+
+	// Drive A's score down (many blocks).
+	for i := 0; i < 10; i++ {
+		p.RecordOutcome("1.1.1.1", false)
+	}
+	// Drive C's score up (many successes).
+	for i := 0; i < 10; i++ {
+		p.RecordOutcome("3.3.3.3", true)
+	}
+	// B stays at neutral (0.5).
+
+	scoreA := p.Score("1.1.1.1")
+	scoreB := p.Score("2.2.2.2")
+	scoreC := p.Score("3.3.3.3")
+	if scoreA >= scoreB {
+		t.Errorf("blocked A score (%v) should be below neutral B (%v)", scoreA, scoreB)
+	}
+	if scoreB >= scoreC {
+		t.Errorf("neutral B score (%v) should be below good C (%v)", scoreB, scoreC)
+	}
+
+	// Sample 10000 picks — C should dominate, A should be rare.
+	counts := map[string]int{}
+	for i := 0; i < 10000; i++ {
+		s, ok := p.Next()
+		if !ok {
+			t.Fatal("pool exhausted unexpectedly")
+		}
+		counts[s.Name]++
+	}
+	if counts["C"] <= counts["B"] {
+		t.Errorf("C (good) should be picked more than B (neutral): C=%d B=%d", counts["C"], counts["B"])
+	}
+	if counts["B"] <= counts["A"] {
+		t.Errorf("B (neutral) should be picked more than A (blocked): B=%d A=%d", counts["B"], counts["A"])
+	}
+	// A must still be reachable (score floor guarantees some picks).
+	if counts["A"] == 0 {
+		t.Errorf("blocked A should still get some picks via score floor, got 0")
+	}
+}
+
+func TestPoolScoreNeutralForUnknown(t *testing.T) {
+	p := NewPool(nil, 10, nil)
+	if got := p.Score("1.2.3.4"); got != scoreNeutral {
+		t.Errorf("unknown IP score = %v, want %v (neutral)", got, scoreNeutral)
 	}
 }
 

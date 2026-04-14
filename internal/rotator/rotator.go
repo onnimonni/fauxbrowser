@@ -265,6 +265,12 @@ func ShouldRotate(status int, h http.Header) (bool, string) {
 	if h.Get("x-sucuri-id") != "" {
 		return true, "sucuri"
 	}
+	// Check Point CloudGuard WAF body-based detection: transport peeks the
+	// 403 body and sets this internal header when it matches. Never sent
+	// to the upstream target — it's on a synthetic header map.
+	if h.Get("X-Checkpoint-Block") != "" {
+		return true, "checkpoint-waf"
+	}
 	return false, ""
 }
 

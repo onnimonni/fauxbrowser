@@ -41,6 +41,20 @@ const (
 	// with X-Vercel-Mitigated: challenge and X-Vercel-Challenge-Token.
 	// Requires a real browser (JavaScript execution) to pass.
 	VercelChallenge
+
+	// AnubisChallenge is the open-source Anubis bot protection
+	// (github.com/TecharoHQ/anubis). It returns HTTP 200 with a
+	// JS proof-of-work challenge page. Detected via Set-Cookie
+	// containing "-anubis-cookie-verification=". NOT an IP
+	// reputation block — VPN rotation does not help. Chromedp
+	// solves it trivially (difficulty ≤ 4 completes in < 1s).
+	AnubisChallenge
+
+	// KasadaChallenge is Kasada's VM-obfuscated JS bot protection
+	// (used by Ticketmaster, StockX, etc.). Detected via x-kpsdk-*
+	// headers on a 429. NOT solvable without the paid Hyper Solutions
+	// SDK API key — IP rotation also does not help.
+	KasadaChallenge
 )
 
 // String returns a stable identifier for logging.
@@ -60,6 +74,10 @@ func (k ChallengeKind) String() string {
 		return "sucuri"
 	case VercelChallenge:
 		return "vercel"
+	case AnubisChallenge:
+		return "anubis"
+	case KasadaChallenge:
+		return "kasada"
 	default:
 		return "none"
 	}
@@ -148,17 +166,36 @@ func DetectChallenge(status int, h http.Header) ChallengeKind {
 		return VercelChallenge
 	}
 
+	// Anubis: returns HTTP 200 with a JS PoW challenge page. The only
+	// reliable header signal is a Set-Cookie containing
+	// "-anubis-cookie-verification=" (name prefix varies per deployment
+	// e.g. "techaro.lol-anubis-cookie-verification="). No status code
+	// check — Anubis always returns 200.
+	for _, sc := range h.Values("Set-Cookie") {
+		if strings.Contains(sc, "-anubis-cookie-verification=") {
+			return AnubisChallenge
+		}
+	}
+
+	// Kasada: VM-obfuscated JS challenge. Detected via x-kpsdk-* headers
+	// (x-kpsdk-ct = "cookie token", x-kpsdk-r = "request token"). Appears
+	// on 429 responses. Not solvable without paid Hyper Solutions SDK.
+	if h.Get("x-kpsdk-ct") != "" || h.Get("x-kpsdk-r") != "" || h.Get("x-kpsdk-sc") != "" {
+		return KasadaChallenge
+	}
+
 	return NotChallenged
 }
 
 // Solvable reports whether a real browser is likely to be able to
 // solve this challenge kind. Sucuri is mostly header-based and
 // doesn't need a browser; the others all require JavaScript
-// execution.
+// execution. Anubis is a JS proof-of-work that any real browser
+// completes trivially.
 func (k ChallengeKind) Solvable() bool {
 	switch k {
 	case CloudflareChallenge, AkamaiChallenge, DataDomeChallenge,
-		PerimeterXChallenge, ImpervaChallenge, VercelChallenge:
+		PerimeterXChallenge, ImpervaChallenge, VercelChallenge, AnubisChallenge:
 		return true
 	default:
 		return false

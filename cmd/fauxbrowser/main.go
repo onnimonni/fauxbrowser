@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -179,6 +180,7 @@ func run() error {
 	// on whether -direct was requested.
 	var (
 		rot         *rotator.Rotator
+		pool        *proton.Pool
 		proxyDialer xnetproxy.ContextDialer
 		exitIPFn    func() string
 		transport   *proxy.Transport
@@ -231,7 +233,7 @@ func run() error {
 			"continents", cfg.VPNContinents,
 			"snapshot", catalog.FetchedAt())
 
-		pool := proton.NewPool(servers, int64(cfg.CooldownSecs), nil)
+		pool = proton.NewPool(servers, int64(cfg.CooldownSecs), nil)
 
 		// Track the previous exit IP across rotations so the OnRotate
 		// hook knows which IP to invalidate in the solver cache.
@@ -280,13 +282,14 @@ func run() error {
 	stats := proxy.NewStatsTracker()
 
 	transport, err = proxy.NewTransport(proxy.TransportOptions{
-		Dialer:         proxyDialer,
-		TimeoutSeconds: cfg.TimeoutSecs,
-		Profile:        cfg.Profile,
-		Rotator:        rot, // nil in direct mode (no rotation)
-		SolverCache:    solverCache,
-		ExitIPProvider: exitIPFn,
-		Stats:          stats,
+		Dialer:             proxyDialer,
+		TimeoutSeconds:     cfg.TimeoutSecs,
+		Profile:            cfg.Profile,
+		Rotator:            rot, // nil in direct mode (no rotation)
+		SolverCache:        solverCache,
+		ExitIPProvider:     exitIPFn,
+		Stats:              stats,
+		ReputationRecorder: pool, // nil in direct mode
 	})
 	if err != nil {
 		return fmt.Errorf("build transport: %w", err)
@@ -317,7 +320,7 @@ func run() error {
 
 	var adminSrv *http.Server
 	if cfg.AdminListen != "" {
-		adminSrv = startAdmin(cfg.AdminListen, cfg.AdminToken, rot, solverCache, stats)
+		adminSrv = startAdmin(cfg.AdminListen, cfg.AdminToken, rot, solverCache, stats, pool)
 	}
 
 	serverErr := make(chan error, 1)
@@ -361,7 +364,7 @@ func run() error {
 // (not the default, but possible).
 const adminPrefix = "/.internal/"
 
-func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Cache, stats *proxy.StatsTracker) *http.Server {
+func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Cache, stats *proxy.StatsTracker, pool *proton.Pool) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc(adminPrefix+"healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -428,6 +431,33 @@ func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Ca
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"hosts": stats.Summary(),
+		})
+	})
+	// GET /.internal/pool — per-IP reputation scores sorted best-first.
+	// Shows how the pool has learned to rank exit IPs at runtime.
+	mux.HandleFunc(adminPrefix+"pool", func(w http.ResponseWriter, _ *http.Request) {
+		if pool == nil {
+			http.Error(w, "pool not available in direct mode", http.StatusNotFound)
+			return
+		}
+		scores := pool.Scores()
+		type entry struct {
+			IP    string  `json:"ip"`
+			Score float64 `json:"score"`
+		}
+		entries := make([]entry, 0, len(scores))
+		for ip, s := range scores {
+			entries = append(entries, entry{ip, s})
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Score > entries[j].Score
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total_servers": pool.Size(),
+			"available":     pool.Available(),
+			"scored_ips":    len(scores),
+			"scores":        entries,
 		})
 	})
 	mux.HandleFunc(adminPrefix+"rotate", func(w http.ResponseWriter, r *http.Request) {

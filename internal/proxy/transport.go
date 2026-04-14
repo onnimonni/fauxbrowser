@@ -21,6 +21,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"fmt"
@@ -44,6 +45,14 @@ import (
 // rotator's per-host quarantine and debounce logic.
 type RotationHook interface {
 	RotateIfTriggered(host string, status int, h http.Header) (bool, string)
+}
+
+// ReputationRecorder receives per-exit-IP quality signals from the
+// transport. The pool uses these to bias future Next() picks toward
+// IPs with better success rates. success=true for 2xx responses;
+// success=false for bot-block responses (429, WAF challenge headers).
+type ReputationRecorder interface {
+	RecordOutcome(exitIP string, success bool)
 }
 
 // TransportOptions parameterize the tls-client transport.
@@ -96,6 +105,11 @@ type TransportOptions struct {
 	// is checked before dispatch to prevent futile traffic to
 	// hosts diagnosed as unreachable.
 	Stats *StatsTracker
+
+	// ReputationRecorder receives per-exit-IP quality signals so the
+	// server pool can learn to prefer IPs that succeed and avoid IPs
+	// that get bot-blocked. Nil = disabled.
+	ReputationRecorder ReputationRecorder
 }
 
 // Transport is an http.RoundTripper backed by a single tls-client with
@@ -312,14 +326,53 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 
-	// Step 3: rotator notification.
-	if t.opts.Rotator != nil {
+	// Step 3a: Check Point CloudGuard body-peek.
+	// Only attempt on 403 responses that don't already have a header-level
+	// WAF signal (to avoid double-counting and wasting the body read).
+	cpBlock := false
+	if resp.StatusCode == 403 && !isBotBlock(resp.StatusCode, resp.Header) {
+		var detected bool
+		detected, resp.Body = peekCheckPoint(resp.Body)
+		if detected {
+			cpBlock = true
+			slog.Info("checkpoint-waf: body-detected block, triggering rotation",
+				"host", host, "exit_ip", exitIP)
+			if t.opts.Rotator != nil {
+				if fired, reason := t.opts.Rotator.RotateIfTriggered(host, 403,
+					http.Header{"X-Checkpoint-Block": {"true"}}); fired {
+					slog.Info("rotation triggered by checkpoint-waf",
+						"host", host, "reason", reason)
+					if t.opts.Stats != nil {
+						t.opts.Stats.RecordRotation(host)
+					}
+				}
+			}
+		}
+	}
+
+	// Step 3: rotator notification + reputation recording.
+	//
+	// isBotBlock is checked once here so both the rotator and the
+	// reputation recorder see the same decision without importing the
+	// rotator package.
+	botBlock := cpBlock || isBotBlock(resp.StatusCode, resp.Header)
+	if !cpBlock && t.opts.Rotator != nil {
 		if fired, reason := t.opts.Rotator.RotateIfTriggered(host, resp.StatusCode, resp.Header); fired {
 			slog.Info("rotation triggered by response heuristic",
 				"status", resp.StatusCode, "host", host, "reason", reason)
 			if t.opts.Stats != nil {
 				t.opts.Stats.RecordRotation(host)
 			}
+		}
+	}
+	// Step 4: feed outcome back to the pool reputation scorer.
+	// Only clear signals are recorded: confirmed bot-blocks (false) and
+	// successful responses (true). 4xx/5xx content errors are neutral.
+	if t.opts.ReputationRecorder != nil && exitIP != "" {
+		if botBlock {
+			t.opts.ReputationRecorder.RecordOutcome(exitIP, false)
+		} else if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			t.opts.ReputationRecorder.RecordOutcome(exitIP, true)
 		}
 	}
 	return resp, nil
@@ -455,6 +508,44 @@ func (t *Transport) dispatch(r *http.Request) (*http.Response, error) {
 		out.ContentLength = -1
 	}
 	return out, nil
+}
+
+// peekCheckPoint reads the first 512 bytes of a 403 response body to
+// detect Check Point CloudGuard WAF blocks ("Access Temporarily
+// Restricted" + "Incident Id" in the body). Returns the detected flag
+// and a reconstructed ReadCloser with the bytes put back so the caller
+// can still forward the body downstream.
+func peekCheckPoint(body io.ReadCloser) (bool, io.ReadCloser) {
+	if body == nil || body == http.NoBody {
+		return false, body
+	}
+	peek := make([]byte, 512)
+	n, _ := io.ReadFull(body, peek)
+	peek = peek[:n]
+	lower := strings.ToLower(string(peek))
+	detected := strings.Contains(lower, "access temporarily restricted") &&
+		strings.Contains(lower, "incident id")
+	// Re-assemble body: peeked bytes + remainder of original stream.
+	restored := io.NopCloser(io.MultiReader(bytes.NewReader(peek), body))
+	return detected, restored
+}
+
+// isBotBlock returns true for responses that signal bot detection / IP
+// reputation blocking. Mirrors the logic in rotator.ShouldRotate but
+// lives here so the transport package doesn't need to import rotator.
+func isBotBlock(status int, h http.Header) bool {
+	if status == 429 {
+		return true
+	}
+	if status != 403 && status != 503 {
+		return false
+	}
+	return h.Get("Cf-Mitigated") != "" ||
+		strings.Contains(strings.ToLower(h.Get("Server")), "cloudflare") ||
+		h.Get("X-Datadome") != "" || h.Get("X-Dd-B") != "" ||
+		h.Get("X-Iinfo") != "" ||
+		strings.Contains(strings.ToLower(h.Get("Server")), "akamai") ||
+		h.Get("X-Sucuri-Id") != ""
 }
 
 // scrubOutboundHeaders clones the incoming request headers and removes

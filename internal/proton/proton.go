@@ -182,16 +182,31 @@ func normalizeSet(xs []string) map[string]struct{} {
 	return m
 }
 
-// Pool is a thread-safe shuffled pool of servers with cooldown support.
-// The rotator pulls from it; tainted servers are recycled back only after
-// the cooldown expires.
+// scoreFloor is the minimum reputation weight an IP retains even after
+// repeated bot-blocks. This prevents a previously-bad IP from being
+// permanently excluded so it can recover if conditions improve.
+const scoreFloor = 0.05
+
+// scoreNeutral is the starting reputation for a newly-seen IP (no data).
+const scoreNeutral = 0.5
+
+// scoreAlpha is the EMA smoothing factor for RecordOutcome updates.
+// Higher = faster adaptation (new outcomes matter more).
+const scoreAlpha = 0.3
+
+// Pool is a thread-safe pool of servers with cooldown support and
+// runtime IP reputation scoring. The rotator pulls from it; tainted
+// servers are recycled after the cooldown expires. Within the
+// non-tainted set, servers are picked by weighted-random selection
+// proportional to their reputation score so known-good IPs are
+// preferred while still giving penalised IPs a chance to recover.
 type Pool struct {
 	mu       sync.Mutex
 	servers  []Server
-	cursor   int
-	tainted  map[string]int64 // entry_ip → unix ts when cooldown ends
-	cooldown int64            // seconds
-	now      func() int64     // injected for tests
+	tainted  map[string]int64   // entry_ip → unix ts when cooldown ends
+	scores   map[string]float64 // entry_ip → EMA reputation [0.0, 1.0]
+	cooldown int64              // seconds
+	now      func() int64       // injected for tests
 }
 
 // NewPool returns a randomly-ordered Pool of the given servers.
@@ -204,13 +219,67 @@ func NewPool(servers []Server, cooldownSeconds int64, nowFn func() int64) *Pool 
 	return &Pool{
 		servers:  cp,
 		tainted:  make(map[string]int64),
+		scores:   make(map[string]float64),
 		cooldown: cooldownSeconds,
 		now:      nowFn,
 	}
 }
 
-// Next returns the next server that isn't currently tainted, advancing
-// the cursor. Returns false if every server is tainted. O(N) worst case.
+// scoreFor returns the effective weight for an entry IP. Caller holds mu.
+func (p *Pool) scoreFor(entryIP string) float64 {
+	s, ok := p.scores[entryIP]
+	if !ok {
+		return scoreNeutral
+	}
+	if s < scoreFloor {
+		return scoreFloor
+	}
+	return s
+}
+
+// RecordOutcome updates the EMA reputation score for an exit IP.
+// success=true raises the score toward 1.0; success=false lowers it
+// toward 0.0. Thread-safe. Called by the transport after each response:
+// a bot-block (429, WAF challenge) records false; a 2xx records true.
+func (p *Pool) RecordOutcome(entryIP string, success bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cur := p.scoreFor(entryIP)
+	outcome := 0.0
+	if success {
+		outcome = 1.0
+	}
+	p.scores[entryIP] = cur + scoreAlpha*(outcome-cur)
+}
+
+// Score returns the current reputation score for an entry IP.
+// Returns scoreNeutral (0.5) for IPs with no recorded outcomes.
+func (p *Pool) Score(entryIP string) float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.scoreFor(entryIP)
+}
+
+// Scores returns a copy of all known IP → reputation score pairs.
+// IPs with no observations are not included. For the admin endpoint.
+func (p *Pool) Scores() map[string]float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]float64, len(p.scores))
+	for ip, s := range p.scores {
+		if s < scoreFloor {
+			s = scoreFloor
+		}
+		out[ip] = s
+	}
+	return out
+}
+
+// Next picks a server from the non-tainted pool using weighted-random
+// selection: each server's probability is proportional to its reputation
+// score. IPs with more bot-block events get lower weights; unknown IPs
+// start at 0.5 (neutral). Returns false only when every server is
+// tainted (WireGuard-level failures), not when scores are merely low.
 func (p *Pool) Next() (Server, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -224,14 +293,35 @@ func (p *Pool) Next() (Server, bool) {
 			delete(p.tainted, ip)
 		}
 	}
-	for i := 0; i < len(p.servers); i++ {
-		s := p.servers[p.cursor]
-		p.cursor = (p.cursor + 1) % len(p.servers)
-		if _, bad := p.tainted[s.EntryIP]; !bad {
-			return s, true
+	// Build weighted candidate list from non-tainted servers.
+	type candidate struct {
+		srv    Server
+		weight float64
+	}
+	cands := make([]candidate, 0, len(p.servers))
+	totalWeight := 0.0
+	for _, s := range p.servers {
+		if _, bad := p.tainted[s.EntryIP]; bad {
+			continue
+		}
+		w := p.scoreFor(s.EntryIP)
+		cands = append(cands, candidate{s, w})
+		totalWeight += w
+	}
+	if len(cands) == 0 {
+		return Server{}, false
+	}
+	// Weighted random pick.
+	r := rand.Float64() * totalWeight
+	accum := 0.0
+	for _, c := range cands {
+		accum += c.weight
+		if r < accum {
+			return c.srv, true
 		}
 	}
-	return Server{}, false
+	// Floating-point rounding fallback: return last candidate.
+	return cands[len(cands)-1].srv, true
 }
 
 // Taint marks a server's entry IP as unusable for the pool's cooldown

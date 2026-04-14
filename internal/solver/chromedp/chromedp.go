@@ -236,12 +236,17 @@ var knownChallengeTitles = []string{
 }
 
 func (s *Solver) waitForSolve(ctx context.Context, host string) error {
-	// Cookie names that signal a solve is complete for specific WAFs.
-	clearanceCookieNames := []string{
+	// clearancePrefixes: cookie names that signal a WAF/PoW challenge
+	// has been solved. Exact-prefix match covers most WAFs.
+	// Vercel cookies included for its bot protection challenge.
+	clearancePrefixes := []string{
 		"cf_clearance", "_abck", "datadome", "_px3", "incap_ses_",
 		// Vercel bot protection cookies
 		"_vcrocs", "__vcz_challenge", "_vercel_jwt",
 	}
+	// clearanceSuffixes: for WAFs whose cookie name prefix varies per
+	// deployment. Anubis cookies are "<domain>-anubis-auth".
+	clearanceSuffixes := []string{"-anubis-auth"}
 
 	tick := time.NewTicker(300 * time.Millisecond)
 	defer tick.Stop()
@@ -260,8 +265,18 @@ func (s *Solver) waitForSolve(ctx context.Context, host string) error {
 		cookies, err := network.GetCookies().Do(ctx)
 		if err == nil {
 			for _, c := range cookies {
-				for _, want := range clearanceCookieNames {
+				for _, want := range clearancePrefixes {
 					if strings.HasPrefix(c.Name, want) {
+						select {
+						case <-time.After(500 * time.Millisecond):
+						case <-ctx.Done():
+							return ctx.Err()
+						}
+						return nil
+					}
+				}
+				for _, want := range clearanceSuffixes {
+					if strings.HasSuffix(c.Name, want) {
 						select {
 						case <-time.After(500 * time.Millisecond):
 						case <-ctx.Done():
