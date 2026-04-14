@@ -83,9 +83,18 @@ func ConfigFromPrivateKey(privateKeyB64 string) (*Config, error) {
 		return nil, errors.New("bad PrivateKey: must be 32-byte base64")
 	}
 	return &Config{
-		PrivateKey:        b,
-		Addresses:         []netip.Addr{netip.MustParseAddr("10.2.0.2")},
-		DNS:               []netip.Addr{netip.MustParseAddr("10.2.0.1")},
+		PrivateKey: b,
+		Addresses:  []netip.Addr{netip.MustParseAddr("10.2.0.2")},
+		// Primary: ProtonVPN internal DNS (inside the tunnel).
+		// Fallbacks: Cloudflare and Google DNS, also routed through the
+		// WireGuard tunnel (AllowedIPs = 0.0.0.0/0). These activate when
+		// the ProtonVPN server's internal DNS (10.2.0.1) is unreachable
+		// or overloaded — a known failure mode on some free servers.
+		DNS: []netip.Addr{
+			netip.MustParseAddr("10.2.0.1"),
+			netip.MustParseAddr("1.1.1.1"),
+			netip.MustParseAddr("8.8.8.8"),
+		},
 		MTU:               1420,
 		PersistentKeepAlv: 25,
 	}, nil
