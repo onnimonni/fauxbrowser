@@ -34,6 +34,11 @@ func TestDetectChallenge(t *testing.T) {
 		{"imperva visid_incap + 403", 403, http.Header{"Set-Cookie": {"visid_incap_12345=junk; Path=/"}}, ImpervaChallenge},
 
 		{"sucuri x-sucuri-id", 403, http.Header{"X-Sucuri-Id": {"blocked"}}, SucuriChallenge},
+
+		{"vercel x-vercel-mitigated challenge", 429, http.Header{"X-Vercel-Mitigated": {"challenge"}, "Server": {"Vercel"}}, VercelChallenge},
+		{"vercel x-vercel-challenge-token", 429, http.Header{"X-Vercel-Challenge-Token": {"2.1776149.abc"}}, VercelChallenge},
+		{"vercel server 429", 429, http.Header{"Server": {"Vercel"}}, VercelChallenge},
+		{"vercel server 200 — not challenge", 200, http.Header{"Server": {"Vercel"}}, NotChallenged},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -48,7 +53,7 @@ func TestDetectChallenge(t *testing.T) {
 func TestChallengeKindSolvable(t *testing.T) {
 	solvable := []ChallengeKind{
 		CloudflareChallenge, AkamaiChallenge, DataDomeChallenge,
-		PerimeterXChallenge, ImpervaChallenge,
+		PerimeterXChallenge, ImpervaChallenge, VercelChallenge,
 	}
 	for _, k := range solvable {
 		if !k.Solvable() {
