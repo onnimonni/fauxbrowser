@@ -319,9 +319,11 @@ in
         #   - user namespaces (its renderer sandbox)
         #   - to fork/exec helper processes
         #   - AF_NETLINK for some platform integrations
-        # so we relax RestrictNamespaces and MemoryDenyWriteExecute
-        # in that mode, and add chromium to PATH so chromedp can
-        # exec it.
+        #   - prlimit64 / setrlimit to set its own resource limits
+        #   - JIT (W+X pages for V8)
+        # so we relax RestrictNamespaces, MemoryDenyWriteExecute, and
+        # the @resources syscall group in that mode, and add chromium
+        # to PATH so chromedp can exec it.
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;
@@ -341,7 +343,16 @@ in
         LockPersonality = true;
         MemoryDenyWriteExecute = if cfg.solver == "chromedp" then false else true;
         SystemCallArchitectures = "native";
-        SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+        # @resources (setrlimit/prlimit64/nice/…) is blocked by default for
+        # security. When chromedp is enabled, Chromium calls setrlimit and
+        # prlimit64 at startup to set its own resource limits. Without these
+        # syscalls the child process is killed by SIGSYS immediately, and the
+        # chromedp allocator sees "chrome failed to start". Allow @resources
+        # only when the chromedp solver is active.
+        SystemCallFilter =
+          if cfg.solver == "chromedp"
+          then [ "@system-service" "~@privileged" ]
+          else [ "@system-service" "~@privileged" "~@resources" ];
         RestrictAddressFamilies =
           if cfg.solver == "chromedp"
           then [ "AF_INET" "AF_INET6" "AF_UNIX" "AF_NETLINK" ]
