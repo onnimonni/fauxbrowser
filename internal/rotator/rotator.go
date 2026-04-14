@@ -540,21 +540,50 @@ func (r *Rotator) Close() {
 	r.current.Store(nil)
 }
 
-// defaultProbe is the liveness check: TCP-dial 1.1.1.1:443 through the
-// fresh tunnel with a short deadline. Proton enforces tier at the
-// routing layer, so a handshake-OK tunnel may still silently drop
-// packets — the probe catches this.
+// defaultProbe is the liveness check run against every freshly
+// established WireGuard tunnel. Proton enforces tier at the routing
+// layer, so a handshake-OK tunnel may still silently drop packets or
+// have a broken DNS resolver — both are caught here.
 //
-// Uses an IP literal so a broken tunnel can't confuse "DNS timeout"
-// with "routing timeout". See SKILL
-// protonvpn-free-key-reuse-and-tier-routing.
+// Two-phase check (timeout split evenly):
+//
+//  1. TCP connectivity: dial 1.1.1.1:443 via IP literal — isolates
+//     routing failures from DNS failures.
+//
+//  2. DNS resolution: resolve cloudflare.com through the tunnel's DNS
+//     server. Some ProtonVPN free servers pass the TCP probe but have
+//     a broken/overloaded 10.2.0.1 resolver, causing every subsequent
+//     request to time out. Catching this here lets the rotator taint
+//     the server and try the next one.
+//
+// See SKILL protonvpn-free-key-reuse-and-tier-routing.
 func defaultProbe(ctx context.Context, tun liveTunnel, timeout time.Duration) error {
-	d, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	conn, err := tun.ContextDialer().DialContext(d, "tcp", "1.1.1.1:443")
+	half := timeout / 2
+
+	// Phase 1: TCP routing probe.
+	tcpCtx, tcpCancel := context.WithTimeout(ctx, half)
+	defer tcpCancel()
+	conn, err := tun.ContextDialer().DialContext(tcpCtx, "tcp", "1.1.1.1:443")
 	if err != nil {
-		return err
+		return fmt.Errorf("tcp probe: %w", err)
 	}
 	_ = conn.Close()
+
+	// Phase 2: DNS probe through the tunnel's resolver.
+	dnsServer := "10.2.0.1:53"
+	if cfg := tun.Config(); len(cfg.DNS) > 0 {
+		dnsServer = cfg.DNS[0].String() + ":53"
+	}
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return tun.ContextDialer().DialContext(ctx, "udp", dnsServer)
+		},
+	}
+	dnsCtx, dnsCancel := context.WithTimeout(ctx, half)
+	defer dnsCancel()
+	if _, err := resolver.LookupHost(dnsCtx, "cloudflare.com"); err != nil {
+		return fmt.Errorf("dns probe: %w", err)
+	}
 	return nil
 }
