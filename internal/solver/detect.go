@@ -36,6 +36,11 @@ const (
 	// SucuriChallenge is the Sucuri firewall. Light WAF, mostly
 	// header-based.
 	SucuriChallenge
+
+	// VercelChallenge is Vercel's built-in bot protection. Responds
+	// with X-Vercel-Mitigated: challenge and X-Vercel-Challenge-Token.
+	// Requires a real browser (JavaScript execution) to pass.
+	VercelChallenge
 )
 
 // String returns a stable identifier for logging.
@@ -53,6 +58,8 @@ func (k ChallengeKind) String() string {
 		return "imperva"
 	case SucuriChallenge:
 		return "sucuri"
+	case VercelChallenge:
+		return "vercel"
 	default:
 		return "none"
 	}
@@ -132,6 +139,15 @@ func DetectChallenge(status int, h http.Header) ChallengeKind {
 		return SucuriChallenge
 	}
 
+	// Vercel: X-Vercel-Mitigated: challenge or X-Vercel-Challenge-Token present.
+	if strings.EqualFold(h.Get("x-vercel-mitigated"), "challenge") || h.Get("x-vercel-challenge-token") != "" {
+		return VercelChallenge
+	}
+	// Vercel also serves its checkpoint via server: Vercel with 429.
+	if strings.EqualFold(server, "vercel") && status == 429 {
+		return VercelChallenge
+	}
+
 	return NotChallenged
 }
 
@@ -142,7 +158,7 @@ func DetectChallenge(status int, h http.Header) ChallengeKind {
 func (k ChallengeKind) Solvable() bool {
 	switch k {
 	case CloudflareChallenge, AkamaiChallenge, DataDomeChallenge,
-		PerimeterXChallenge, ImpervaChallenge:
+		PerimeterXChallenge, ImpervaChallenge, VercelChallenge:
 		return true
 	default:
 		return false

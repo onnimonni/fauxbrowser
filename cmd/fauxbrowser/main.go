@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"time"
 
+	xnetproxy "golang.org/x/net/proxy"
+
 	"github.com/onnimonni/fauxbrowser/internal/config"
 	"github.com/onnimonni/fauxbrowser/internal/proton"
 	"github.com/onnimonni/fauxbrowser/internal/proxy"
@@ -72,6 +74,7 @@ func run() error {
 	fs.DurationVar(&cfg.ReaperInterval, "reaper-interval", cfg.ReaperInterval, "how often the reaper scans for drained tunnels")
 	fs.StringVar(&cfg.AuthToken, "auth-token", cfg.AuthToken, "bearer token required on the proxy listener (mandatory on non-loopback binds)")
 	fs.StringVar(&cfg.AdminToken, "admin-token", cfg.AdminToken, "bearer token required on the admin listener (mandatory on non-loopback binds)")
+	fs.BoolVar(&cfg.Direct, "direct", cfg.Direct, "bypass WireGuard: route all outbound connections directly through the host's network (Chrome TLS fingerprint + solver still active; no VPN tunnel)")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "debug|info|warn|error")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	_ = fs.Parse(os.Args[1:])
@@ -93,54 +96,11 @@ func run() error {
 		return err
 	}
 
-	// Either -wg-conf (a wg-quick file path) or -wg-private-key
-	// (gluetun-style env, just the base64 key) is required.
-	if cfg.WGConf == "" && cfg.WGPrivateKey == "" {
-		return errors.New("either -wg-conf or -wg-private-key (or WIREGUARD_PRIVATE_KEY env) is required")
+	// In direct mode WireGuard is bypassed entirely; otherwise either
+	// -wg-conf or -wg-private-key is required.
+	if !cfg.Direct && cfg.WGConf == "" && cfg.WGPrivateKey == "" {
+		return errors.New("either -wg-conf or -wg-private-key (or WIREGUARD_PRIVATE_KEY env) is required; use -direct to skip the VPN tunnel")
 	}
-	var (
-		baseCfg *wgtunnel.Config
-		err     error
-	)
-	if cfg.WGConf != "" {
-		baseCfg, err = wgtunnel.LoadConfig(cfg.WGConf)
-		if err != nil {
-			return fmt.Errorf("load wg conf: %w", err)
-		}
-	} else {
-		baseCfg, err = wgtunnel.ConfigFromPrivateKey(cfg.WGPrivateKey)
-		if err != nil {
-			return fmt.Errorf("parse wg private key: %w", err)
-		}
-		slog.Info("WireGuard interface bootstrapped from private key only",
-			"address", "10.2.0.2/32", "dns", "10.2.0.1")
-	}
-	// The base conf's peer fields are DISCARDED — rotator picks peers
-	// from the Proton catalog. Wipe them to make that invariant loud.
-	baseCfg.PeerPublicKey = nil
-	baseCfg.PeerPresharedKey = nil
-	baseCfg.EndpointHost = ""
-	baseCfg.EndpointPort = 0
-
-	catalog, err := proton.Embedded()
-	if err != nil {
-		return fmt.Errorf("load proton catalog: %w", err)
-	}
-	tierFilter := proton.ParseTierFilter(cfg.VPNTier)
-	servers := catalog.Filter(tierFilter, cfg.VPNCountries, cfg.VPNContinents)
-	if len(servers) == 0 {
-		return fmt.Errorf("no Proton servers match tier=%s countries=%v continents=%v",
-			cfg.VPNTier, cfg.VPNCountries, cfg.VPNContinents)
-	}
-	slog.Info("proton catalog loaded",
-		"total", catalog.Len(),
-		"filtered", len(servers),
-		"tier", cfg.VPNTier,
-		"countries", cfg.VPNCountries,
-		"continents", cfg.VPNContinents,
-		"snapshot", catalog.FetchedAt())
-
-	pool := proton.NewPool(servers, int64(cfg.CooldownSecs), nil)
 
 	// Optional WAF challenge solver. Built BEFORE the rotator so the
 	// rotator's OnRotate hook can call cache.InvalidateExit on the
@@ -215,72 +175,117 @@ func run() error {
 			"cookie_store", cfg.CookieStorePath)
 	}
 
-	var transport *proxy.Transport
-	// Track the previous exit IP across rotations so the OnRotate
-	// hook knows which IP to invalidate in the solver cache.
-	var prevExitIP atomic.Pointer[string]
-	emptyIP := ""
-	prevExitIP.Store(&emptyIP)
+	// Build either a WireGuard rotator or a plain net.Dialer depending
+	// on whether -direct was requested.
+	var (
+		rot         *rotator.Rotator
+		proxyDialer xnetproxy.ContextDialer
+		exitIPFn    func() string
+		transport   *proxy.Transport
+	)
 
-	var rot *rotator.Rotator
-	rot = rotator.New(rotator.Options{
-		BaseConfig:        baseCfg,
-		Catalog:           catalog,
-		Pool:              pool,
-		HandshakeTimeout:  cfg.HandshakeWait,
-		MinHostRotation:   cfg.MinHostRotation,
-		GlobalMinInterval: cfg.GlobalMinInterval,
-		MaxRetireAge:      cfg.MaxRetireAge,
-		ReaperInterval:    cfg.ReaperInterval,
-		OnRotate: func() {
-			// After the swap, clear our internal tls-client cookie
-			// jar (Set-Cookie from upstream) so stale non-CF session
-			// cookies don't leak to the new IP. Caller-set Cookie
-			// headers on incoming requests are untouched.
-			if transport != nil {
-				if err := transport.RotateJar(); err != nil {
-					slog.Warn("rotator: jar rebuild failed", "err", err)
-				}
+	if cfg.Direct {
+		// Direct mode: use the host's default network stack.
+		nd := &net.Dialer{Timeout: time.Duration(cfg.TimeoutSecs) * time.Second}
+		proxyDialer = nd
+		exitIPFn = func() string { return "direct" }
+	} else {
+		// VPN mode: bring up WireGuard + rotator.
+		var (
+			baseCfg *wgtunnel.Config
+			err     error
+		)
+		if cfg.WGConf != "" {
+			baseCfg, err = wgtunnel.LoadConfig(cfg.WGConf)
+			if err != nil {
+				return fmt.Errorf("load wg conf: %w", err)
 			}
-			// Solver cache cookies (cf_clearance, _abck, etc.) are
-			// PRESERVED across rotations. They're keyed by (host,
-			// exitIP) — if the pool cycles back to the same IP
-			// later, the cached cookies are ready. Cookies are only
-			// invalidated when a CF-specific 403 rejects them
-			// (handled by transport's MarkRetryFailed + Invalidate).
-			//
-			// Snapshot the new exit IP for the next rotation event.
-			newIP := rot.Stats().CurrentIP
-			prevExitIP.Store(&newIP)
-
-			// Full sync to disk on rotation in case new entries
-			// were added since the last per-entry auto-persist.
-			if solverCache != nil && cfg.CookieStorePath != "" {
-				if err := solverCache.SaveToDir(cfg.CookieStorePath); err != nil {
-					slog.Warn("solver: disk sync failed", "err", err)
-				}
+		} else {
+			baseCfg, err = wgtunnel.ConfigFromPrivateKey(cfg.WGPrivateKey)
+			if err != nil {
+				return fmt.Errorf("parse wg private key: %w", err)
 			}
-		},
-		Logf: func(msg string, args ...any) { slog.Info(msg, args...) },
-	})
-	defer rot.Close()
+			slog.Info("WireGuard interface bootstrapped from private key only",
+				"address", "10.2.0.2/32", "dns", "10.2.0.1")
+		}
+		baseCfg.PeerPublicKey = nil
+		baseCfg.PeerPresharedKey = nil
+		baseCfg.EndpointHost = ""
+		baseCfg.EndpointPort = 0
 
-	bootstrapCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	if err := rot.Bootstrap(bootstrapCtx); err != nil {
+		catalog, err := proton.Embedded()
+		if err != nil {
+			return fmt.Errorf("load proton catalog: %w", err)
+		}
+		tierFilter := proton.ParseTierFilter(cfg.VPNTier)
+		servers := catalog.Filter(tierFilter, cfg.VPNCountries, cfg.VPNContinents)
+		if len(servers) == 0 {
+			return fmt.Errorf("no Proton servers match tier=%s countries=%v continents=%v",
+				cfg.VPNTier, cfg.VPNCountries, cfg.VPNContinents)
+		}
+		slog.Info("proton catalog loaded",
+			"total", catalog.Len(),
+			"filtered", len(servers),
+			"tier", cfg.VPNTier,
+			"countries", cfg.VPNCountries,
+			"continents", cfg.VPNContinents,
+			"snapshot", catalog.FetchedAt())
+
+		pool := proton.NewPool(servers, int64(cfg.CooldownSecs), nil)
+
+		// Track the previous exit IP across rotations so the OnRotate
+		// hook knows which IP to invalidate in the solver cache.
+		var prevExitIP atomic.Pointer[string]
+		emptyIP := ""
+		prevExitIP.Store(&emptyIP)
+
+		rot = rotator.New(rotator.Options{
+			BaseConfig:        baseCfg,
+			Catalog:           catalog,
+			Pool:              pool,
+			HandshakeTimeout:  cfg.HandshakeWait,
+			MinHostRotation:   cfg.MinHostRotation,
+			GlobalMinInterval: cfg.GlobalMinInterval,
+			MaxRetireAge:      cfg.MaxRetireAge,
+			ReaperInterval:    cfg.ReaperInterval,
+			OnRotate: func() {
+				if transport != nil {
+					if err := transport.RotateJar(); err != nil {
+						slog.Warn("rotator: jar rebuild failed", "err", err)
+					}
+				}
+				newIP := rot.Stats().CurrentIP
+				prevExitIP.Store(&newIP)
+				if solverCache != nil && cfg.CookieStorePath != "" {
+					if err := solverCache.SaveToDir(cfg.CookieStorePath); err != nil {
+						slog.Warn("solver: disk sync failed", "err", err)
+					}
+				}
+			},
+			Logf: func(msg string, args ...any) { slog.Info(msg, args...) },
+		})
+		defer rot.Close()
+
+		bootstrapCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		if err := rot.Bootstrap(bootstrapCtx); err != nil {
+			cancel()
+			return fmt.Errorf("bring up initial tunnel: %w", err)
+		}
 		cancel()
-		return fmt.Errorf("bring up initial tunnel: %w", err)
+
+		proxyDialer = rot.Dialer()
+		exitIPFn = func() string { return rot.Stats().CurrentIP }
 	}
-	cancel()
 
 	stats := proxy.NewStatsTracker()
 
 	transport, err = proxy.NewTransport(proxy.TransportOptions{
-		Dialer:         rot.Dialer(),
+		Dialer:         proxyDialer,
 		TimeoutSeconds: cfg.TimeoutSecs,
 		Profile:        cfg.Profile,
-		Rotator:        rot,
+		Rotator:        rot, // nil in direct mode (no rotation)
 		SolverCache:    solverCache,
-		ExitIPProvider: func() string { return rot.Stats().CurrentIP },
+		ExitIPProvider: exitIPFn,
 		Stats:          stats,
 	})
 	if err != nil {
@@ -291,15 +296,8 @@ func run() error {
 	base := proxy.NewHandler(proxy.Options{
 		TargetHeader: cfg.TargetHeader,
 		Transport:    transport,
-		// Same dialer used by the Transport — routes through the
-		// current WireGuard tunnel and honors per-host quarantine.
-		// CONNECT tunnels go through this directly, bypassing
-		// tls-client (the client speaks its own TLS to the target).
-		Dialer: rot.Dialer(),
+		Dialer:       proxyDialer,
 	})
-	// BearerAuth is a no-op when AuthToken is empty (loopback default).
-	// When bound to a non-loopback, safetyCheck has already refused to
-	// start without a token, so auth here is always enforced.
 	handler := proxy.WrapH2C(proxy.BearerAuth(base, cfg.AuthToken))
 
 	srv := &http.Server{
@@ -311,8 +309,8 @@ func run() error {
 	slog.Info("fauxbrowser ready",
 		"version", version,
 		"listen", cfg.Listen,
-		"exit_ip", rot.Stats().CurrentIP,
-		"pool_size", pool.Size())
+		"exit_ip", exitIPFn(),
+		"mode", map[bool]string{true: "direct", false: "wireguard"}[cfg.Direct])
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -367,6 +365,10 @@ func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Ca
 	mux := http.NewServeMux()
 	mux.HandleFunc(adminPrefix+"healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if rot == nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"mode": "direct", "CurrentIP": "direct"})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(rot.Stats())
 	})
 	// /.internal/solver exposes the per-host solver circuit-breaker
@@ -431,6 +433,10 @@ func startAdmin(addr, token string, rot *rotator.Rotator, solverCache *solver.Ca
 	mux.HandleFunc(adminPrefix+"rotate", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		if rot == nil {
+			http.Error(w, "rotation not available in direct mode", http.StatusNotImplemented)
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)

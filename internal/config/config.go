@@ -52,6 +52,14 @@ type Config struct {
 	// be reused across deploys without re-solving.
 	CookieStorePath string
 
+	// Direct disables WireGuard entirely. All outbound connections
+	// go directly through the host's network. The Chrome TLS
+	// fingerprint forging, header scrubbing, and WAF solver still
+	// apply — only the VPN tunnel is bypassed. Useful for local
+	// debugging or for sites where VPN IP reputation causes issues.
+	// When Direct=true, WGConf/WGPrivateKey are not required.
+	Direct bool
+
 	// AllowVersionMismatch permits fauxbrowser to start when the
 	// chromedp solver's Chromium binary has a Chrome major version
 	// that disagrees with the active tls-client profile (or has no
@@ -110,6 +118,12 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("FAUXBROWSER_ADMIN_TOKEN"); v != "" {
 		c.AdminToken = v
+	}
+	if v := strings.ToLower(os.Getenv("FAUXBROWSER_DIRECT")); v != "" {
+		switch v {
+		case "1", "true", "yes", "on":
+			c.Direct = true
+		}
 	}
 	if v := os.Getenv("FAUXBROWSER_WG_CONF"); v != "" {
 		c.WGConf = v

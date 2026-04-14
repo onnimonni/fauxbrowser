@@ -178,8 +178,14 @@ func (s *Solver) Solve(ctx context.Context, target *url.URL) (*solver.Solution, 
 	}
 
 	httpCookies := convertCookies(cookies, target.Host)
+	// Some WAFs (e.g. Vercel) set session cookies that are domain-scoped
+	// broadly; if domain filtering eliminated all cookies, fall back to
+	// returning ALL cookies so the retry path has something to stamp.
 	if len(httpCookies) == 0 {
-		return nil, errors.New("chromedp solve: no cookies returned (challenge may not have completed)")
+		httpCookies = convertAllCookies(cookies)
+		if len(httpCookies) == 0 {
+			return nil, errors.New("chromedp solve: no cookies returned (challenge may not have completed)")
+		}
 	}
 
 	cookieNames := make([]string, 0, len(httpCookies))
@@ -213,8 +219,29 @@ func (s *Solver) Solve(ctx context.Context, target *url.URL) (*solver.Solution, 
 // Instead we wait until a known clearance cookie name actually
 // appears in the browser's cookie store. The deadline is the
 // solve timeout minus 1 second.
+// knownChallengeTitles is a set of page titles that indicate a WAF
+// challenge is still in progress. When a Chromium session's title
+// leaves this set (and a settle delay passes), the challenge is
+// considered solved even if no known clearance cookie is present.
+// This is necessary for WAFs (like Vercel) that use cookie names
+// we can't enumerate in advance.
+var knownChallengeTitles = []string{
+	"just a moment",           // Cloudflare IUAM / Turnstile
+	"vercel security checkpoint", // Vercel bot protection
+	"security check",          // generic checkpoint pages
+	"access denied",           // pre-challenge denial page
+	"please wait",             // generic wait pages
+	"ddos-guard",              // DDoS-Guard
+	"checking your browser",   // generic checks
+}
+
 func (s *Solver) waitForSolve(ctx context.Context, host string) error {
-	clearanceCookieNames := []string{"cf_clearance", "_abck", "datadome", "_px3", "incap_ses_"}
+	// Cookie names that signal a solve is complete for specific WAFs.
+	clearanceCookieNames := []string{
+		"cf_clearance", "_abck", "datadome", "_px3", "incap_ses_",
+		// Vercel bot protection cookies
+		"_vcrocs", "__vcz_challenge", "_vercel_jwt",
+	}
 
 	tick := time.NewTicker(300 * time.Millisecond)
 	defer tick.Stop()
@@ -229,15 +256,12 @@ func (s *Solver) waitForSolve(ctx context.Context, host string) error {
 	}
 
 	for {
+		// Check cookies first — definitive signal for known WAFs.
 		cookies, err := network.GetCookies().Do(ctx)
 		if err == nil {
 			for _, c := range cookies {
 				for _, want := range clearanceCookieNames {
 					if strings.HasPrefix(c.Name, want) {
-						// Found a clearance cookie. Give the page
-						// 500ms more to settle (some sites set
-						// additional cookies right after) then
-						// return.
 						select {
 						case <-time.After(500 * time.Millisecond):
 						case <-ctx.Done():
@@ -248,10 +272,38 @@ func (s *Solver) waitForSolve(ctx context.Context, host string) error {
 				}
 			}
 		}
+
+		// Fallback: check if the page title has left the challenge
+		// set. Vercel's checkpoint and similar JS-challenge pages
+		// redirect/rewrite the title once the PoW passes; if the
+		// title is no longer a known challenge title the cookies
+		// should be stable.
+		var title string
+		if titleErr := chromedp.Title(&title).Do(ctx); titleErr == nil {
+			titleLower := strings.ToLower(strings.TrimSpace(title))
+			isChallenge := false
+			for _, ct := range knownChallengeTitles {
+				if strings.Contains(titleLower, ct) {
+					isChallenge = true
+					break
+				}
+			}
+			if !isChallenge && title != "" {
+				// Title is no longer a challenge page. Wait a bit
+				// for cookies to settle, then return.
+				select {
+				case <-time.After(1 * time.Second):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				return nil
+			}
+		}
+
 		select {
 		case <-tick.C:
 		case <-deadline.C:
-			return errors.New("waitForSolve: deadline exceeded — no clearance cookie observed")
+			return errors.New("waitForSolve: deadline exceeded — no clearance cookie or title change observed")
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -259,8 +311,7 @@ func (s *Solver) waitForSolve(ctx context.Context, host string) error {
 }
 
 // convertCookies translates chromedp's network.Cookie into
-// http.Cookie, dropping cookies that don't apply to the target
-// host.
+// http.Cookie, keeping only cookies that apply to the target host.
 func convertCookies(cookies []*network.Cookie, targetHost string) []*http.Cookie {
 	out := make([]*http.Cookie, 0, len(cookies))
 	for _, c := range cookies {
@@ -268,6 +319,24 @@ func convertCookies(cookies []*network.Cookie, targetHost string) []*http.Cookie
 		if domain != targetHost && !strings.HasSuffix(targetHost, "."+domain) {
 			continue
 		}
+		out = append(out, &http.Cookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Domain:   c.Domain,
+			Path:     c.Path,
+			Secure:   c.Secure,
+			HttpOnly: c.HTTPOnly,
+		})
+	}
+	return out
+}
+
+// convertAllCookies is a fallback that converts all cookies without
+// host-based filtering. Used when convertCookies returns empty (e.g.
+// Vercel sets cookies on broad domains that don't match targetHost).
+func convertAllCookies(cookies []*network.Cookie) []*http.Cookie {
+	out := make([]*http.Cookie, 0, len(cookies))
+	for _, c := range cookies {
 		out = append(out, &http.Cookie{
 			Name:     c.Name,
 			Value:    c.Value,
