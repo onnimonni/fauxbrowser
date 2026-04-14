@@ -58,6 +58,7 @@ func run() error {
 	fs.DurationVar(&cfg.SolverTimeout, "solver-timeout", cfg.SolverTimeout, "max time per Chromium solve (startup + navigation + extract)")
 	fs.StringVar(&cfg.ChromiumPath, "chromium-path", cfg.ChromiumPath, "absolute Chromium binary path (default = $PATH lookup)")
 	fs.StringVar(&cfg.CookieStorePath, "cookie-store", cfg.CookieStorePath, "directory for persisting CF cookie cache — one file per (host, exitIP), survives restarts (empty = in-memory only)")
+	fs.StringVar(&cfg.ScoresPath, "scores-path", cfg.ScoresPath, "file for persisting per-IP reputation scores across restarts (empty = in-memory only)")
 	fs.BoolVar(&cfg.AllowVersionMismatch, "allow-version-mismatch", cfg.AllowVersionMismatch,
 		"start even if chromedp solver's Chromium has a Chrome major version that has no matching tls-client profile "+
 			"(or disagrees with an explicit -profile). Use when nixpkgs chromium just got bumped to N+1 and bogdanfinn/tls-client "+
@@ -234,6 +235,13 @@ func run() error {
 			"snapshot", catalog.FetchedAt())
 
 		pool = proton.NewPool(servers, int64(cfg.CooldownSecs), nil)
+		if cfg.ScoresPath != "" {
+			if err := pool.LoadScores(cfg.ScoresPath); err != nil {
+				slog.Warn("pool: could not load scores from disk", "path", cfg.ScoresPath, "err", err)
+			} else {
+				slog.Info("pool: loaded reputation scores from disk", "path", cfg.ScoresPath)
+			}
+		}
 
 		// Track the previous exit IP across rotations so the OnRotate
 		// hook knows which IP to invalidate in the solver cache.
@@ -351,6 +359,14 @@ func run() error {
 			slog.Warn("solver: cookie store save on shutdown failed", "err", err)
 		} else {
 			slog.Info("solver: cookie store saved", "dir", cfg.CookieStorePath, "entries", solverCache.Size())
+		}
+	}
+	// Persist reputation scores on clean shutdown.
+	if pool != nil && cfg.ScoresPath != "" {
+		if err := pool.SaveScores(); err != nil {
+			slog.Warn("pool: score save on shutdown failed", "err", err)
+		} else {
+			slog.Info("pool: reputation scores saved", "path", cfg.ScoresPath)
 		}
 	}
 	return nil

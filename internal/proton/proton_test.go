@@ -1,6 +1,8 @@
 package proton
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -262,5 +264,48 @@ func TestPoolEmpty(t *testing.T) {
 	p := NewPool(nil, 10, nil)
 	if _, ok := p.Next(); ok {
 		t.Errorf("empty pool Next should be !ok")
+	}
+}
+
+func TestPoolScorePersistence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "scores.json")
+
+	p := NewPool([]Server{{Name: "A", EntryIP: "1.1.1.1", Pubkey: "a"}}, 10, nil)
+
+	// Record some outcomes then save.
+	for i := 0; i < 5; i++ {
+		p.RecordOutcome("1.1.1.1", true)
+	}
+	savedScore := p.Score("1.1.1.1")
+	if savedScore <= scoreNeutral {
+		t.Fatalf("expected score above neutral after successes, got %v", savedScore)
+	}
+
+	if err := p.SaveScores(); err != nil {
+		t.Fatalf("SaveScores: %v", err)
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Error("SaveScores with no path set should not create a file")
+	}
+
+	// Now with path configured.
+	if err := p.LoadScores(path); err != nil {
+		t.Fatalf("LoadScores on missing file: %v", err)
+	}
+	if err := p.SaveScores(); err != nil {
+		t.Fatalf("SaveScores: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected scores file at %q: %v", path, err)
+	}
+
+	// New pool, load the saved scores, verify they match.
+	p2 := NewPool([]Server{{Name: "A", EntryIP: "1.1.1.1", Pubkey: "a"}}, 10, nil)
+	if err := p2.LoadScores(path); err != nil {
+		t.Fatalf("LoadScores: %v", err)
+	}
+	if got := p2.Score("1.1.1.1"); got != savedScore {
+		t.Errorf("restored score = %v, want %v", got, savedScore)
 	}
 }

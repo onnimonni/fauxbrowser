@@ -52,6 +52,12 @@ type Config struct {
 	// be reused across deploys without re-solving.
 	CookieStorePath string
 
+	// ScoresPath is an optional file path for persisting the pool's
+	// per-IP EMA reputation scores to disk. When set, scores are
+	// loaded on startup and saved every ~5s (debounced) + on shutdown.
+	// Survives process restarts so the pool doesn't start blind.
+	ScoresPath string
+
 	// Direct disables WireGuard entirely. All outbound connections
 	// go directly through the host's network. The Chrome TLS
 	// fingerprint forging, header scrubbing, and WAF solver still
@@ -169,6 +175,9 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("FAUXBROWSER_COOKIE_STORE"); v != "" {
 		c.CookieStorePath = v
+	}
+	if v := os.Getenv("FAUXBROWSER_SCORES_PATH"); v != "" {
+		c.ScoresPath = v
 	}
 	if v := strings.ToLower(os.Getenv("FAUXBROWSER_ALLOW_VERSION_MISMATCH")); v != "" {
 		switch v {

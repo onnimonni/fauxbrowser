@@ -22,8 +22,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 //go:embed snapshot.json
@@ -207,6 +209,10 @@ type Pool struct {
 	scores   map[string]float64 // entry_ip → EMA reputation [0.0, 1.0]
 	cooldown int64              // seconds
 	now      func() int64       // injected for tests
+
+	scoresPath  string        // path for score persistence; empty = disabled
+	saveTimer   *time.Timer   // debounce timer for async save
+	savePending bool          // true while timer is armed
 }
 
 // NewPool returns a randomly-ordered Pool of the given servers.
@@ -241,6 +247,7 @@ func (p *Pool) scoreFor(entryIP string) float64 {
 // success=true raises the score toward 1.0; success=false lowers it
 // toward 0.0. Thread-safe. Called by the transport after each response:
 // a bot-block (429, WAF challenge) records false; a 2xx records true.
+// If a scoresPath is configured, schedules a debounced async save.
 func (p *Pool) RecordOutcome(entryIP string, success bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -250,6 +257,111 @@ func (p *Pool) RecordOutcome(entryIP string, success bool) {
 		outcome = 1.0
 	}
 	p.scores[entryIP] = cur + scoreAlpha*(outcome-cur)
+	p.scheduleSaveLocked()
+}
+
+// scheduleSaveLocked arms/resets the debounce timer. Caller holds mu.
+func (p *Pool) scheduleSaveLocked() {
+	if p.scoresPath == "" {
+		return
+	}
+	const debounce = 5 * time.Second
+	if p.savePending {
+		p.saveTimer.Reset(debounce)
+		return
+	}
+	p.savePending = true
+	p.saveTimer = time.AfterFunc(debounce, func() {
+		p.mu.Lock()
+		p.savePending = false
+		path := p.scoresPath
+		snap := make(map[string]float64, len(p.scores))
+		for k, v := range p.scores {
+			snap[k] = v
+		}
+		p.mu.Unlock()
+		if err := saveScoresFile(path, snap); err != nil {
+			// Non-fatal: next RecordOutcome will retry.
+			_ = err
+		}
+	})
+}
+
+// SetScoresPath configures where reputation scores are persisted.
+// Call before the pool is used; safe to call concurrently otherwise.
+func (p *Pool) SetScoresPath(path string) {
+	p.mu.Lock()
+	p.scoresPath = path
+	p.mu.Unlock()
+}
+
+// LoadScores reads a previously saved scores file and merges it into
+// the pool. Unknown IPs are ignored. Call once at startup before
+// the pool is handed to the rotator.
+func (p *Pool) LoadScores(path string) error {
+	// Always record the path so SaveScores knows where to write,
+	// even if the file doesn't exist yet (first run).
+	p.mu.Lock()
+	p.scoresPath = path
+	p.mu.Unlock()
+
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil // first run — fine
+	}
+	if err != nil {
+		return fmt.Errorf("proton: load scores %q: %w", path, err)
+	}
+	var snap map[string]float64
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return fmt.Errorf("proton: parse scores %q: %w", path, err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for k, v := range snap {
+		if v >= 0 && v <= 1.0 {
+			p.scores[k] = v
+		}
+	}
+	return nil
+}
+
+// SaveScores flushes the current scores to disk immediately. Intended
+// for graceful shutdown so no data is lost between debounce flushes.
+func (p *Pool) SaveScores() error {
+	p.mu.Lock()
+	if p.scoresPath == "" {
+		p.mu.Unlock()
+		return nil
+	}
+	// Cancel pending debounce timer if any.
+	if p.savePending && p.saveTimer != nil {
+		p.saveTimer.Stop()
+		p.savePending = false
+	}
+	path := p.scoresPath
+	snap := make(map[string]float64, len(p.scores))
+	for k, v := range p.scores {
+		snap[k] = v
+	}
+	p.mu.Unlock()
+	return saveScoresFile(path, snap)
+}
+
+func saveScoresFile(path string, scores map[string]float64) error {
+	data, err := json.Marshal(scores)
+	if err != nil {
+		return err
+	}
+	// Write to temp file then rename for atomicity.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("proton: write scores %q: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("proton: rename scores: %w", err)
+	}
+	return nil
 }
 
 // Score returns the current reputation score for an entry IP.
