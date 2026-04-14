@@ -241,11 +241,20 @@ func (r *Rotator) hostGate(host string) <-chan struct{} {
 //	status == 429  → always (rate limit)
 //	status == 503  → only with Cloudflare/challenge marker
 //	status == 403  → only with known WAF challenge marker
+//	status == 400  → only with Cf-Ray: - (Cloudflare IP/ASN-level early block)
 //
 // The transport calls this on every response.
 func ShouldRotate(status int, h http.Header) (bool, string) {
 	if status == 429 {
 		return true, "429 rate limit"
+	}
+	// Cloudflare early IP/ASN block: the request was dropped before routing
+	// (no ray ID generated). Rotating to a different exit IP is the only
+	// remedy — no amount of cookie-solving helps here.
+	if status == 400 {
+		if ray := h.Get("Cf-Ray"); ray == "-" {
+			return true, "cloudflare 400 ip-block (Cf-Ray: -)"
+		}
 	}
 	if status != 403 && status != 503 {
 		return false, ""
