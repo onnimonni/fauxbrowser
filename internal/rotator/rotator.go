@@ -397,6 +397,7 @@ func (r *Rotator) rotate(ctx context.Context, reason string) (*tunnelBinding, er
 		tun, err := r.opts.Tunneler.Start(newCfg)
 		if err != nil {
 			r.opts.Pool.Taint(srv.EntryIP)
+			r.opts.Pool.RecordOutcome(srv.EntryIP, false)
 			lastErr = fmt.Errorf("start: %w", err)
 			continue
 		}
@@ -405,6 +406,7 @@ func (r *Rotator) rotate(ctx context.Context, reason string) (*tunnelBinding, er
 				"name", srv.Name, "entry_ip", srv.EntryIP, "err", err.Error())
 			_ = tun.Close()
 			r.opts.Pool.Taint(srv.EntryIP)
+			r.opts.Pool.RecordOutcome(srv.EntryIP, false)
 			lastErr = err
 			continue
 		}
@@ -413,9 +415,13 @@ func (r *Rotator) rotate(ctx context.Context, reason string) (*tunnelBinding, er
 				"name", srv.Name, "entry_ip", srv.EntryIP, "err", err.Error())
 			_ = tun.Close()
 			r.opts.Pool.Taint(srv.EntryIP)
+			r.opts.Pool.RecordOutcome(srv.EntryIP, false)
 			lastErr = err
 			continue
 		}
+		// Probe succeeded — record positive outcome so this IP is preferred
+		// in future weighted-random picks and fallback selection.
+		r.opts.Pool.RecordOutcome(srv.EntryIP, true)
 		// Success. Register the new binding, swap current, retire old.
 		nb := &tunnelBinding{
 			tun:       tun,
@@ -543,18 +549,22 @@ func (r *Rotator) Close() {
 // defaultProbe is the liveness check run against every freshly
 // established WireGuard tunnel. Proton enforces tier at the routing
 // layer, so a handshake-OK tunnel may still silently drop packets or
-// have a broken DNS resolver — both are caught here.
+// route traffic without working DNS — both are caught here.
 //
 // Two-phase check (timeout split evenly):
 //
 //  1. TCP connectivity: dial 1.1.1.1:443 via IP literal — isolates
-//     routing failures from DNS failures.
+//     routing failures from DNS failures. If this fails the tunnel
+//     can't route any traffic at all.
 //
-//  2. DNS resolution: resolve cloudflare.com through the tunnel's DNS
-//     server. Some ProtonVPN free servers pass the TCP probe but have
-//     a broken/overloaded 10.2.0.1 resolver, causing every subsequent
-//     request to time out. Catching this here lets the rotator taint
-//     the server and try the next one.
+//  2. DNS resolution over TCP: resolve cloudflare.com through the
+//     tunnel's DNS server using TCP (not UDP). Some ProtonVPN free
+//     servers pass the TCP routing probe but have a broken/overloaded
+//     10.2.0.1 resolver, causing every subsequent request to time out.
+//     TCP DNS is used because the gVisor-based userspace WireGuard
+//     netstack has unreliable UDP support — UDP-based DNS probes fail
+//     for all servers even when TCP routing works perfectly, which
+//     causes the entire pool to be tainted on startup.
 //
 // See SKILL protonvpn-free-key-reuse-and-tier-routing.
 func defaultProbe(ctx context.Context, tun liveTunnel, timeout time.Duration) error {
@@ -569,7 +579,10 @@ func defaultProbe(ctx context.Context, tun liveTunnel, timeout time.Duration) er
 	}
 	_ = conn.Close()
 
-	// Phase 2: DNS probe through the tunnel's resolver.
+	// Phase 2: DNS resolution over TCP through the tunnel's resolver.
+	// UDP is intentionally avoided: the gVisor netstack used by userspace
+	// WireGuard has unreliable UDP dial support, causing UDP DNS probes to
+	// time out for all servers even when TCP routing works correctly.
 	dnsServer := "10.2.0.1:53"
 	if cfg := tun.Config(); len(cfg.DNS) > 0 {
 		dnsServer = cfg.DNS[0].String() + ":53"
@@ -577,7 +590,8 @@ func defaultProbe(ctx context.Context, tun liveTunnel, timeout time.Duration) er
 	resolver := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return tun.ContextDialer().DialContext(ctx, "udp", dnsServer)
+			// TCP DNS (RFC 5966): same port 53 but over TCP connection.
+			return tun.ContextDialer().DialContext(ctx, "tcp", dnsServer)
 		},
 	}
 	dnsCtx, dnsCancel := context.WithTimeout(ctx, half)

@@ -390,8 +390,14 @@ func (p *Pool) Scores() map[string]float64 {
 // Next picks a server from the non-tainted pool using weighted-random
 // selection: each server's probability is proportional to its reputation
 // score. IPs with more bot-block events get lower weights; unknown IPs
-// start at 0.5 (neutral). Returns false only when every server is
-// tainted (WireGuard-level failures), not when scores are merely low.
+// start at 0.5 (neutral).
+//
+// When every server is tainted (all failed WireGuard probes within the
+// cooldown window), Next falls back to the highest-scored server across
+// the whole pool, temporarily lifting its taint so the rotator can
+// attempt a connection. This prevents hard failures when a transient
+// network condition taints all peers simultaneously — the system keeps
+// trying rather than stopping. If no servers exist at all, returns false.
 func (p *Pool) Next() (Server, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -421,7 +427,11 @@ func (p *Pool) Next() (Server, bool) {
 		totalWeight += w
 	}
 	if len(cands) == 0 {
-		return Server{}, false
+		// All servers tainted. Fall back to the best-scored one so the
+		// rotator can still attempt tunnels. The server's taint is
+		// temporarily lifted; the rotator re-taints on failure, so the
+		// next call here will pick the next-best-scored server instead.
+		return p.bestScoredFallbackLocked()
 	}
 	// Weighted random pick.
 	r := rand.Float64() * totalWeight
@@ -434,6 +444,30 @@ func (p *Pool) Next() (Server, bool) {
 	}
 	// Floating-point rounding fallback: return last candidate.
 	return cands[len(cands)-1].srv, true
+}
+
+// bestScoredFallbackLocked picks the highest-scored server across the entire
+// pool (including tainted), removes its taint, and returns it. This is the
+// emergency path used when every IP is tainted: the rotator still gets a
+// candidate to try, and score-based ordering ensures historically-good IPs
+// are attempted before historically-bad ones. Caller must hold p.mu.
+func (p *Pool) bestScoredFallbackLocked() (Server, bool) {
+	if len(p.servers) == 0 {
+		return Server{}, false
+	}
+	best := p.servers[0]
+	bestScore := p.scoreFor(p.servers[0].EntryIP)
+	for _, s := range p.servers[1:] {
+		if sc := p.scoreFor(s.EntryIP); sc > bestScore {
+			bestScore = sc
+			best = s
+		}
+	}
+	// Lift the taint so the rotator can attempt this server.
+	// If the tunnel attempt fails the rotator calls Taint() again,
+	// so the next Next() call will prefer the second-best server.
+	delete(p.tainted, best.EntryIP)
+	return best, true
 }
 
 // Taint marks a server's entry IP as unusable for the pool's cooldown
