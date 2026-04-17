@@ -15,8 +15,15 @@ func TestConfigFromPrivateKey(t *testing.T) {
 	if len(cfg.Addresses) != 1 || cfg.Addresses[0].String() != "10.2.0.2" {
 		t.Errorf("Addresses = %v, want [10.2.0.2]", cfg.Addresses)
 	}
-	if len(cfg.DNS) != 1 || cfg.DNS[0].String() != "10.2.0.1" {
-		t.Errorf("DNS = %v, want [10.2.0.1]", cfg.DNS)
+	wantDNS := []string{"10.2.0.1", "1.1.1.1", "8.8.8.8"}
+	if len(cfg.DNS) != len(wantDNS) {
+		t.Errorf("DNS = %v, want %v", cfg.DNS, wantDNS)
+	} else {
+		for i, want := range wantDNS {
+			if cfg.DNS[i].String() != want {
+				t.Errorf("DNS[%d] = %v, want %v", i, cfg.DNS[i], want)
+			}
+		}
 	}
 	if cfg.MTU != 1420 {
 		t.Errorf("MTU = %d, want 1420", cfg.MTU)

@@ -110,6 +110,13 @@ type TransportOptions struct {
 	// server pool can learn to prefer IPs that succeed and avoid IPs
 	// that get bot-blocked. Nil = disabled.
 	ReputationRecorder ReputationRecorder
+
+	// MaxIdleConnsPerHost limits the number of idle (keep-alive)
+	// outbound connections the tls-client transport retains per target
+	// hostname. 0 keeps tls-client's built-in default (2), which is too
+	// low for high-concurrency use. 100 is a good starting point for
+	// 500+ concurrent crawl workers.
+	MaxIdleConnsPerHost int
 }
 
 // Transport is an http.RoundTripper backed by a single tls-client with
@@ -178,11 +185,14 @@ func (t *Transport) rebuildClient() error {
 			return t.opts.Dialer, nil
 		}),
 	}
-	if t.opts.RootCAs != nil {
-		opts = append(opts, tls_client.WithTransportOptions(&tls_client.TransportOptions{
-			RootCAs: t.opts.RootCAs,
-		}))
-	}
+	// Always apply transport options so MaxIdleConnsPerHost takes effect
+	// even when no custom RootCAs were provided. tls-client's built-in
+	// default is MaxIdleConnsPerHost=2, which is far too low for
+	// high-concurrency crawl workloads (500+ workers).
+	opts = append(opts, tls_client.WithTransportOptions(&tls_client.TransportOptions{
+		RootCAs:             t.opts.RootCAs,
+		MaxIdleConnsPerHost: t.opts.MaxIdleConnsPerHost,
+	}))
 	c, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
 	if err != nil {
 		return fmt.Errorf("tls-client new: %w", err)

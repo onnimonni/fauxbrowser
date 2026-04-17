@@ -67,6 +67,7 @@ func run() error {
 	fs.StringVar(&countriesFlag, "vpn-country", strings.Join(cfg.VPNCountries, ","), "comma-separated ISO country allow-list (e.g. NL,DE)")
 	var continentsFlag string
 	fs.StringVar(&continentsFlag, "vpn-continent", strings.Join(cfg.VPNContinents, ","), "comma-separated continent allow-list (EU,NA,AS,OC,SA,AF)")
+	fs.IntVar(&cfg.MaxIdleConnsPerHost, "max-idle-conns-per-host", cfg.MaxIdleConnsPerHost, "max idle outbound connections per target hostname (default 100; tls-client default is 2)")
 	fs.IntVar(&cfg.TimeoutSecs, "timeout", cfg.TimeoutSecs, "per-request upstream timeout seconds")
 	fs.IntVar(&cfg.CooldownSecs, "cooldown", cfg.CooldownSecs, "taint cooldown for a burned exit IP, seconds")
 	fs.DurationVar(&cfg.HandshakeWait, "handshake-wait", cfg.HandshakeWait, "max time to wait for a WireGuard handshake per rotation attempt")
@@ -290,14 +291,15 @@ func run() error {
 	stats := proxy.NewStatsTracker()
 
 	transport, err = proxy.NewTransport(proxy.TransportOptions{
-		Dialer:             proxyDialer,
-		TimeoutSeconds:     cfg.TimeoutSecs,
-		Profile:            cfg.Profile,
-		Rotator:            rot, // nil in direct mode (no rotation)
-		SolverCache:        solverCache,
-		ExitIPProvider:     exitIPFn,
-		Stats:              stats,
-		ReputationRecorder: pool, // nil in direct mode
+		Dialer:              proxyDialer,
+		TimeoutSeconds:      cfg.TimeoutSecs,
+		Profile:             cfg.Profile,
+		Rotator:             rot, // nil in direct mode (no rotation)
+		SolverCache:         solverCache,
+		ExitIPProvider:      exitIPFn,
+		Stats:               stats,
+		ReputationRecorder:  pool, // nil in direct mode
+		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
 	})
 	if err != nil {
 		return fmt.Errorf("build transport: %w", err)
