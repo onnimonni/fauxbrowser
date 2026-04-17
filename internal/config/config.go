@@ -77,8 +77,14 @@ type Config struct {
 	// bogdanfinn/tls-client hasn't shipped chromeN+1 yet".
 	AllowVersionMismatch bool
 
-	TimeoutSecs   int
-	CooldownSecs  int           // taint cooldown per server after 429/403
+	// MaxIdleConnsPerHost limits how many idle (keep-alive) outbound
+	// connections the tls-client transport keeps per target hostname.
+	// Go / tls-client's built-in default is 2, which is far too low
+	// for 500+ concurrent crawl workers. 0 means "use the default (2)".
+	MaxIdleConnsPerHost int
+
+	TimeoutSecs  int
+	CooldownSecs int // taint cooldown per server after 429/403
 	HandshakeWait time.Duration // handshake observation window per rotation attempt
 
 	// Blue/green rotator tuning.
@@ -99,8 +105,9 @@ func Default() *Config {
 		Solver:        "none",
 		SolverTTL:     25 * time.Minute,
 		SolverTimeout: 30 * time.Second,
-		TimeoutSecs:   60,
-		CooldownSecs:      900, // 15 min
+		MaxIdleConnsPerHost: 100,
+		TimeoutSecs:         60,
+		CooldownSecs:        900, // 15 min
 		HandshakeWait:     6 * time.Second,
 		MinHostRotation:   5 * time.Minute,
 		GlobalMinInterval: 2 * time.Second,
@@ -196,6 +203,11 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("FAUXBROWSER_VPN_CONTINENTS"); v != "" {
 		c.VPNContinents = SplitCSV(v)
+	}
+	if v := os.Getenv("FAUXBROWSER_MAX_IDLE_CONNS_PER_HOST"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.MaxIdleConnsPerHost = n
+		}
 	}
 	if v := os.Getenv("FAUXBROWSER_TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
