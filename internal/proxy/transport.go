@@ -385,6 +385,18 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 			t.opts.ReputationRecorder.RecordOutcome(exitIP, true)
 		}
 	}
+
+	// Stamp the exit IP on every proxied response so callers can track
+	// which VPN exit IPs produce successful vs blocked results per host.
+	// This enables callers to build per-host IP reputation data and
+	// prefer IPs that are not blocked by a given site.
+	if exitIP != "" {
+		if resp.Header == nil {
+			resp.Header = make(http.Header)
+		}
+		resp.Header.Set("X-Fauxbrowser-Exit-IP", exitIP)
+	}
+
 	return resp, nil
 }
 
