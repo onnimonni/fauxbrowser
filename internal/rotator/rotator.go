@@ -548,56 +548,26 @@ func (r *Rotator) Close() {
 
 // defaultProbe is the liveness check run against every freshly
 // established WireGuard tunnel. Proton enforces tier at the routing
-// layer, so a handshake-OK tunnel may still silently drop packets or
-// route traffic without working DNS — both are caught here.
+// layer, so a handshake-OK tunnel may still silently drop packets.
 //
-// Two-phase check (timeout split evenly):
+// TCP connectivity: dial 1.1.1.1:443 via IP literal — proves traffic
+// actually flows through the tunnel and that routing isn't silently
+// dropped. IP literal avoids any DNS dependency in the probe itself;
+// DNS failures in real crawl requests surface as "no route to host"
+// errors handled by the existing retry / rotation machinery.
 //
-//  1. TCP connectivity: dial 1.1.1.1:443 via IP literal — isolates
-//     routing failures from DNS failures. If this fails the tunnel
-//     can't route any traffic at all.
-//
-//  2. DNS resolution over TCP: resolve cloudflare.com through the
-//     tunnel's DNS server using TCP (not UDP). Some ProtonVPN free
-//     servers pass the TCP routing probe but have a broken/overloaded
-//     10.2.0.1 resolver, causing every subsequent request to time out.
-//     TCP DNS is used because the gVisor-based userspace WireGuard
-//     netstack has unreliable UDP support — UDP-based DNS probes fail
-//     for all servers even when TCP routing works perfectly, which
-//     causes the entire pool to be tainted on startup.
-//
-// See SKILL protonvpn-free-key-reuse-and-tier-routing.
+// UDP DNS is NOT used because the gVisor-based userspace WireGuard
+// netstack has unreliable UDP support. TCP DNS (RFC 5966) is also not
+// used because ProtonVPN's 10.2.0.1 resolver does not accept TCP DNS
+// connections — they time out for all servers even though TCP routing
+// to public IPs works correctly.
 func defaultProbe(ctx context.Context, tun liveTunnel, timeout time.Duration) error {
-	half := timeout / 2
-
-	// Phase 1: TCP routing probe.
-	tcpCtx, tcpCancel := context.WithTimeout(ctx, half)
+	tcpCtx, tcpCancel := context.WithTimeout(ctx, timeout)
 	defer tcpCancel()
 	conn, err := tun.ContextDialer().DialContext(tcpCtx, "tcp", "1.1.1.1:443")
 	if err != nil {
 		return fmt.Errorf("tcp probe: %w", err)
 	}
 	_ = conn.Close()
-
-	// Phase 2: DNS resolution over TCP through the tunnel's resolver.
-	// UDP is intentionally avoided: the gVisor netstack used by userspace
-	// WireGuard has unreliable UDP dial support, causing UDP DNS probes to
-	// time out for all servers even when TCP routing works correctly.
-	dnsServer := "10.2.0.1:53"
-	if cfg := tun.Config(); len(cfg.DNS) > 0 {
-		dnsServer = cfg.DNS[0].String() + ":53"
-	}
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			// TCP DNS (RFC 5966): same port 53 but over TCP connection.
-			return tun.ContextDialer().DialContext(ctx, "tcp", dnsServer)
-		},
-	}
-	dnsCtx, dnsCancel := context.WithTimeout(ctx, half)
-	defer dnsCancel()
-	if _, err := resolver.LookupHost(dnsCtx, "cloudflare.com"); err != nil {
-		return fmt.Errorf("dns probe: %w", err)
-	}
 	return nil
 }
