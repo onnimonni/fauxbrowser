@@ -3,7 +3,10 @@
 {
   packages = [ pkgs.git pkgs.curl ];
 
-  languages.go.enable = true;
+  languages.go = {
+    enable = true;
+    package = pkgs.go_1_26;
+  };
 
   # Install a pre-push git hook that blocks v*.*.* tag pushes when
   # flake.nix's `version = "X.Y.Z"` literal doesn't match. This is
