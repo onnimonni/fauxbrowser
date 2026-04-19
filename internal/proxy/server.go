@@ -200,6 +200,16 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.ContextD
 	// bytes the HTTP parser already pulled off the wire — typically
 	// the start of the client's TLS ClientHello) and from upstream.
 	// On either side closing, both directions tear down.
+	//
+	// connectTunnelTimeout caps how long a CONNECT tunnel can live.
+	// Without a bound, a hung upstream or a misbehaving client (e.g.
+	// a Chromium process the solver failed to kill) keeps the hijacked
+	// clientConn fd open indefinitely, contributing to fd exhaustion.
+	// 10 minutes is generous for any WAF-solve Chromium session.
+	const connectTunnelTimeout = 10 * time.Minute
+	tunnelCtx, tunnelCancel := context.WithTimeout(r.Context(), connectTunnelTimeout)
+	defer tunnelCancel()
+
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(upstream, bufrw)
@@ -218,10 +228,23 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer proxy.ContextD
 		}
 		done <- struct{}{}
 	}()
-	<-done
+	select {
+	case <-done:
+	case <-tunnelCtx.Done():
+		slog.Warn("CONNECT tunnel: timeout or context cancelled, force-closing",
+			"target", target)
+	}
 	_ = upstream.Close()
 	_ = clientConn.Close()
-	<-done
+	// Drain the second goroutine with a short deadline to avoid leaking
+	// it after force-close. Both goroutines should exit quickly now that
+	// both connections are closed.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		slog.Warn("CONNECT tunnel: second goroutine did not exit, leaking",
+			"target", target)
+	}
 	slog.Debug("CONNECT tunnel closed", "target", target)
 }
 

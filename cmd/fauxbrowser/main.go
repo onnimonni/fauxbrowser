@@ -314,9 +314,19 @@ func run() error {
 	handler := proxy.WrapH2C(proxy.BearerAuth(base, cfg.AuthToken))
 
 	srv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           handler,
+		Addr:    cfg.Listen,
+		Handler: handler,
+		// ReadHeaderTimeout: reject slow-loris attacks on the header phase.
 		ReadHeaderTimeout: 15 * time.Second,
+		// IdleTimeout: proactively close idle HTTP/1.1 keep-alive connections
+		// before the client does. Without this, clients (e.g. Elixir Finch
+		// with pool_max_idle_time=30s) send FIN first, leaving fauxbrowser in
+		// CLOSE_WAIT until the kernel cleans up. Under high crawl concurrency
+		// CLOSE_WAIT connections accumulate faster than the scheduler can clean
+		// them, exhausting the process fd limit (524288 on modern systemd).
+		// 20s < Finch's pool_max_idle_time=30s means fauxbrowser closes
+		// first → no CLOSE_WAIT on the fauxbrowser side.
+		IdleTimeout: 20 * time.Second,
 	}
 
 	slog.Info("fauxbrowser ready",
