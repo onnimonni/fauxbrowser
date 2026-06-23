@@ -117,6 +117,20 @@ type TransportOptions struct {
 	// low for high-concurrency use. 100 is a good starting point for
 	// 500+ concurrent crawl workers.
 	MaxIdleConnsPerHost int
+
+	// RetryAttempts is the max number of dispatch attempts for a single
+	// request when the response is a 429/WAF block. >1 enables auto-retry
+	// on a DIFFERENT exit IP (requires ExitSwitcher; GET/HEAD only unless
+	// the request carries X-Fauxbrowser-Retry: idempotent). 1 = disabled.
+	RetryAttempts int
+
+	// ExitSwitcher burns the current exit and moves to another for retry.
+	// Nil = retry disabled (single dispatch).
+	ExitSwitcher ExitSwitcher
+
+	// PassthroughHeaders globally skips browser-document header forging
+	// (see passthroughHeader). Per-request override via the header.
+	PassthroughHeaders bool
 }
 
 // Transport is an http.RoundTripper backed by a single tls-client with
@@ -263,9 +277,15 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 
-	resp, err := t.dispatch(r)
+	resp, err := t.dispatchWithRetry(r, host)
 	if err != nil {
 		return nil, err
+	}
+	// The retry loop may have switched exits; refresh exitIP so the
+	// reputation recording + X-Fauxbrowser-Exit-IP stamp reflect the exit
+	// that produced THIS response.
+	if t.opts.ExitIPProvider != nil {
+		exitIP = t.opts.ExitIPProvider()
 	}
 
 	// Record the request outcome for per-host diagnostics.
@@ -400,6 +420,77 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// requestReplayable reports whether a request body can be safely re-sent on a
+// retry. GET/HEAD (idempotent, usually bodyless) always; other methods only
+// with an explicit opt-in header to avoid double-submitting writes.
+func requestReplayable(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, "":
+		return true
+	default:
+		return strings.EqualFold(r.Header.Get(retryOptInHeader), "idempotent")
+	}
+}
+
+// dispatchWithRetry runs dispatch and, when auto-retry is enabled, replays a
+// 429/WAF-blocked request on a DIFFERENT exit IP (up to RetryAttempts),
+// tainting the burned exit. Forward-proxy mode only (CONNECT never reaches the
+// transport). Returns the first good response, or the last block after the
+// retry budget is spent (so the caller still sees the upstream 429).
+func (t *Transport) dispatchWithRetry(r *http.Request, host string) (*http.Response, error) {
+	attempts := t.opts.RetryAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts == 1 || t.opts.ExitSwitcher == nil || !requestReplayable(r) {
+		return t.dispatch(r)
+	}
+
+	// Buffer the body once so each attempt gets a fresh reader.
+	var bodyBytes []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		b, err := io.ReadAll(io.LimitReader(r.Body, maxReplayBody+1))
+		_ = r.Body.Close()
+		if err != nil || len(b) > maxReplayBody {
+			// Unreadable or oversize → not replayable; best-effort single shot.
+			r.Body = io.NopCloser(bytes.NewReader(b))
+			r.ContentLength = int64(len(b))
+			return t.dispatch(r)
+		}
+		bodyBytes = b
+	}
+
+	var resp *http.Response
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if bodyBytes != nil {
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			r.ContentLength = int64(len(bodyBytes))
+		}
+		resp, err = t.dispatch(r)
+		if err != nil {
+			return nil, err
+		}
+		if attempt == attempts-1 || !isBotBlock(resp.StatusCode, resp.Header) {
+			return resp, nil
+		}
+		// Retryable block with budget left: burn this exit, switch, replay.
+		burned := ""
+		if t.opts.ExitIPProvider != nil {
+			burned = t.opts.ExitIPProvider()
+		}
+		newIP, switchErr := t.opts.ExitSwitcher.SwitchAvoiding(r.Context(), burned)
+		if switchErr != nil || newIP == "" {
+			return resp, nil // no alternate exit → give caller the block
+		}
+		_ = resp.Body.Close() // discard the blocked body before replaying
+		slog.Info("retry: 429/WAF — replaying on a different exit",
+			"host", host, "status", resp.StatusCode,
+			"burned_ip", burned, "new_ip", newIP, "attempt", attempt+1)
+	}
+	return resp, nil
+}
+
 // solveAndRetry runs the solver via the cache and re-dispatches
 // the original request with the new cookies stamped on.
 func (t *Transport) solveAndRetry(orig *http.Request, host, exitIP string) (*http.Response, error) {
@@ -459,6 +550,8 @@ func (t *Transport) dispatch(r *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("transport closed")
 	}
 
+	passthrough := t.opts.PassthroughHeaders || r.Header.Get(passthroughHeader) != ""
+
 	egress := scrubOutboundHeaders(r.Header)
 	// Auto-detect Accept-Language from target TLD if the caller
 	// didn't set one. Must run BEFORE applyProfileDefaults so the
@@ -466,7 +559,14 @@ func (t *Transport) dispatch(r *http.Request) (*http.Response, error) {
 	if egress.Get("Accept-Language") == "" {
 		egress.Set("Accept-Language", AcceptLanguageForHost(r.URL.Hostname()))
 	}
-	egress = applyProfileDefaults(egress, t.profile)
+	if passthrough {
+		// Keep TLS↔UA coherence (forced UA/sec-ch-ua), but DON'T inject the
+		// browser-document soft defaults (Accept:text/html, Sec-Fetch-*) that
+		// make JSON API gateways 502. Honor the caller's headers verbatim.
+		egress = applyForcedProfileHeaders(egress, t.profile)
+	} else {
+		egress = applyProfileDefaults(egress, t.profile)
+	}
 
 	body := r.Body
 	if body == nil {
@@ -490,7 +590,11 @@ func (t *Transport) dispatch(r *http.Request) (*http.Response, error) {
 	// fhttp uses HeaderOrderKey to control the h2 HEADERS frame
 	// serialization; without it, Go's map iteration order produces
 	// a random/inconsistent order that some WAFs fingerprint.
-	freq.Header[fhttp.HeaderOrderKey] = chromeHeaderOrder
+	// Skipped in passthrough mode (the document-navigation order is part
+	// of what makes JSON gateways 502).
+	if !passthrough {
+		freq.Header[fhttp.HeaderOrderKey] = chromeHeaderOrder
+	}
 
 	fresp, err := client.Do(freq)
 	if err != nil {
@@ -597,8 +701,27 @@ func scrubOutboundHeaders(in http.Header) http.Header {
 var fauxbrowserControlHeaders = []string{
 	"X-Target-URL",
 	"X-Target-Scheme",
+	"X-Fauxbrowser-Passthrough",
+	"X-Fauxbrowser-Retry",
 	"Proxy-Authorization",
 	"Proxy-Connection",
+}
+
+const (
+	// passthroughHeader, when present on a request, skips browser-document
+	// header forging for that request (honors the caller's Accept/Sec-Fetch/
+	// X-Requested-With) — needed for JSON APIs that 502 on a browser shape.
+	passthroughHeader = "X-Fauxbrowser-Passthrough"
+	// retryOptInHeader allows auto-retry of a NON-idempotent request.
+	retryOptInHeader = "X-Fauxbrowser-Retry"
+	// maxReplayBody caps the request body buffered for replay on retry.
+	maxReplayBody = 1 << 20 // 1 MiB
+)
+
+// ExitSwitcher lets the transport burn the exit that produced a 429/WAF and
+// move to a different live exit for the retry. Implemented by *rotator.Rotator.
+type ExitSwitcher interface {
+	SwitchAvoiding(ctx context.Context, burnedExitIP string) (newExitIP string, err error)
 }
 
 var staticHopByHop = []string{

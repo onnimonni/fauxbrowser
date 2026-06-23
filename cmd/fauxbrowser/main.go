@@ -68,6 +68,9 @@ func run() error {
 	var continentsFlag string
 	fs.StringVar(&continentsFlag, "vpn-continent", strings.Join(cfg.VPNContinents, ","), "comma-separated continent allow-list (EU,NA,AS,OC,SA,AF)")
 	fs.IntVar(&cfg.MaxIdleConnsPerHost, "max-idle-conns-per-host", cfg.MaxIdleConnsPerHost, "max idle outbound connections per target hostname (default 100; tls-client default is 2)")
+	fs.IntVar(&cfg.PoolSize, "pool-size", cfg.PoolSize, "number of concurrent live tunnels/exit IPs (default 1; N>1 dispatches least-loaded → ~N× throughput, capped by Proton's session limit)")
+	fs.IntVar(&cfg.RetryAttempts, "retry-attempts", cfg.RetryAttempts, "max attempts per request on 429/WAF; >1 auto-retries on a different exit IP (GET/HEAD, or opt-in via X-Fauxbrowser-Retry: idempotent)")
+	fs.BoolVar(&cfg.PassthroughHeaders, "passthrough-headers", cfg.PassthroughHeaders, "skip browser-document header forging (Accept:text/html, Sec-Fetch-*, header order) so JSON/XHR APIs don't 502; keeps UA/TLS coherence")
 	fs.IntVar(&cfg.TimeoutSecs, "timeout", cfg.TimeoutSecs, "per-request upstream timeout seconds")
 	fs.IntVar(&cfg.CooldownSecs, "cooldown", cfg.CooldownSecs, "taint cooldown for a burned exit IP, seconds")
 	fs.DurationVar(&cfg.HandshakeWait, "handshake-wait", cfg.HandshakeWait, "max time to wait for a WireGuard handshake per rotation attempt")
@@ -181,11 +184,12 @@ func run() error {
 	// Build either a WireGuard rotator or a plain net.Dialer depending
 	// on whether -direct was requested.
 	var (
-		rot         *rotator.Rotator
-		pool        *proton.Pool
-		proxyDialer xnetproxy.ContextDialer
-		exitIPFn    func() string
-		transport   *proxy.Transport
+		rot          *rotator.Rotator
+		pool         *proton.Pool
+		proxyDialer  xnetproxy.ContextDialer
+		exitIPFn     func() string
+		transport    *proxy.Transport
+		exitSwitcher proxy.ExitSwitcher // nil in direct mode → retry disabled
 	)
 
 	if cfg.Direct {
@@ -259,6 +263,7 @@ func run() error {
 			GlobalMinInterval: cfg.GlobalMinInterval,
 			MaxRetireAge:      cfg.MaxRetireAge,
 			ReaperInterval:    cfg.ReaperInterval,
+			PoolSize:          cfg.PoolSize,
 			OnRotate: func() {
 				if transport != nil {
 					if err := transport.RotateJar(); err != nil {
@@ -277,7 +282,12 @@ func run() error {
 		})
 		defer rot.Close()
 
-		bootstrapCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		// Bootstrap brings up PoolSize tunnels; scale the deadline accordingly.
+		bootTimeout := 90 * time.Second
+		if d := time.Duration(cfg.PoolSize) * (cfg.HandshakeWait + 4*time.Second); d > bootTimeout {
+			bootTimeout = d
+		}
+		bootstrapCtx, cancel := context.WithTimeout(context.Background(), bootTimeout)
 		if err := rot.Bootstrap(bootstrapCtx); err != nil {
 			cancel()
 			return fmt.Errorf("bring up initial tunnel: %w", err)
@@ -286,6 +296,7 @@ func run() error {
 
 		proxyDialer = rot.Dialer()
 		exitIPFn = func() string { return rot.Stats().CurrentIP }
+		exitSwitcher = rot // true-nil interface stays nil in direct mode
 	}
 
 	stats := proxy.NewStatsTracker()
@@ -300,6 +311,9 @@ func run() error {
 		Stats:               stats,
 		ReputationRecorder:  pool, // nil in direct mode
 		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
+		RetryAttempts:       cfg.RetryAttempts,
+		ExitSwitcher:        exitSwitcher, // nil in direct mode → retry disabled
+		PassthroughHeaders:  cfg.PassthroughHeaders,
 	})
 	if err != nil {
 		return fmt.Errorf("build transport: %w", err)

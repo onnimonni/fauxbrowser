@@ -46,6 +46,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -103,6 +104,12 @@ type Options struct {
 	// Injectable for tests.
 	ProbeFn func(ctx context.Context, tun liveTunnel, timeout time.Duration) error
 
+	// PoolSize is the target number of concurrent live tunnels. 1 (the
+	// default) reproduces the classic single-active-tunnel behavior.
+	// N>1 keeps N exits up and dispatches requests least-loaded across
+	// them, so aggregate throughput ≈ N × the per-exit-IP rate limit.
+	PoolSize int
+
 	// OnRotate fires synchronously on every successful swap.
 	// fauxbrowser uses it to rebuild the transport's cookie jar.
 	OnRotate func()
@@ -117,6 +124,14 @@ type Rotator struct {
 
 	current atomic.Pointer[tunnelBinding]
 
+	// activeSet is the copy-on-write set of live bindings used for
+	// least-loaded dispatch. Read lock-free on the hot dial path; every
+	// mutation (addOne / eject / rotate) rebuilds the slice and Stores a
+	// fresh pointer, all serialized by rotMu. `current` is kept pointing
+	// at a member of activeSet for Stats / ExitIPProvider / N=1 fallback.
+	activeSet atomic.Pointer[[]*tunnelBinding]
+	rrCounter atomic.Uint64 // round-robin tiebreak for equal-load bindings
+
 	allMu sync.Mutex
 	all   []*tunnelBinding
 
@@ -127,9 +142,18 @@ type Rotator struct {
 	rotations atomic.Uint64
 	lastRotAt atomic.Int64 // unix nanos
 
-	closed     atomic.Bool
-	reaperStop chan struct{}
-	reaperDone chan struct{}
+	// settleUntil (unix nanos) backs off the maintain loop after repeated
+	// backfill failures (Proton concurrent-session cap reached).
+	settleUntil atomic.Int64
+	// bootstrapped gates the maintain loop so it can't race the bootstrap
+	// fill and overshoot PoolSize.
+	bootstrapped atomic.Bool
+
+	closed       atomic.Bool
+	reaperStop   chan struct{}
+	reaperDone   chan struct{}
+	maintainStop chan struct{}
+	maintainDone chan struct{}
 }
 
 // hostState tracks per-host quarantine + debounce.
@@ -160,6 +184,9 @@ func New(opts Options) *Rotator {
 	if opts.ReaperInterval <= 0 {
 		opts.ReaperInterval = 5 * time.Second
 	}
+	if opts.PoolSize <= 0 {
+		opts.PoolSize = 1
+	}
 	if opts.Tunneler == nil {
 		opts.Tunneler = defaultTunneler{}
 	}
@@ -170,19 +197,42 @@ func New(opts Options) *Rotator {
 		opts.Logf = func(msg string, args ...any) { slog.Info(msg, args...) }
 	}
 	return &Rotator{
-		opts:       opts,
-		hosts:      make(map[string]*hostState),
-		reaperStop: make(chan struct{}),
-		reaperDone: make(chan struct{}),
+		opts:         opts,
+		hosts:        make(map[string]*hostState),
+		reaperStop:   make(chan struct{}),
+		reaperDone:   make(chan struct{}),
+		maintainStop: make(chan struct{}),
+		maintainDone: make(chan struct{}),
 	}
 }
 
-// Bootstrap picks an initial server, brings up the first tunnel, and
-// starts the reaper goroutine.
+// Bootstrap brings up PoolSize tunnels and starts the reaper + maintain
+// goroutines. Succeeds if at least one tunnel comes up; logs and settles
+// below target if the Proton session cap is hit before reaching PoolSize.
 func (r *Rotator) Bootstrap(ctx context.Context) error {
 	go r.reaperLoop()
-	_, err := r.rotate(ctx, "bootstrap")
-	return err
+	go r.maintainLoop() // gated by `bootstrapped` so it can't race the fill below
+	var firstErr error
+	up := 0
+	for i := 0; i < r.opts.PoolSize; i++ {
+		if _, err := r.addOne(ctx, "bootstrap"); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			break // session cap / pool exhausted — settle at what we have
+		}
+		up++
+	}
+	r.bootstrapped.Store(true) // now the maintain loop may backfill
+	if up == 0 {
+		return firstErr
+	}
+	if up < r.opts.PoolSize {
+		r.opts.Logf("rotator: pool settling below target at bootstrap",
+			"target", r.opts.PoolSize, "achieved", up, "err", fmt.Sprintf("%v", firstErr))
+		r.settleUntil.Store(time.Now().Add(45 * time.Second).UnixNano())
+	}
+	return nil
 }
 
 // Dialer returns a proxy.ContextDialer that routes through the current
@@ -209,11 +259,89 @@ func (d *rotDialer) DialContext(ctx context.Context, network, address string) (n
 			return nil, ctx.Err()
 		}
 	}
-	binding := d.r.current.Load()
+	binding := d.r.pickBinding()
 	if binding == nil {
 		return nil, errors.New("rotator: no tunnel available")
 	}
 	return binding.dial(ctx, network, address)
+}
+
+// pickBinding returns the least-loaded live binding (min inflight), with a
+// round-robin tiebreak so equal-load exits spread evenly. Lock-free read of
+// the copy-on-write active set. Falls back to `current` before the set is
+// populated (bootstrap) or if it is empty.
+func (r *Rotator) pickBinding() *tunnelBinding {
+	setp := r.activeSet.Load()
+	if setp == nil || len(*setp) == 0 {
+		return r.current.Load()
+	}
+	s := *setp
+	if len(s) == 1 {
+		return s[0]
+	}
+	start := int(r.rrCounter.Add(1))
+	best := s[start%len(s)]
+	bestN := best.inflight.Load()
+	for i := 1; i < len(s); i++ {
+		b := s[(start+i)%len(s)]
+		if n := b.inflight.Load(); n < bestN {
+			best, bestN = b, n
+		}
+	}
+	return best
+}
+
+// addToActive / removeFromActive rebuild the active set copy-on-write.
+// Callers MUST hold rotMu.
+func (r *Rotator) addToActive(b *tunnelBinding) {
+	cur := r.activeSet.Load()
+	var next []*tunnelBinding
+	if cur != nil {
+		next = append(next, (*cur)...)
+	}
+	next = append(next, b)
+	r.activeSet.Store(&next)
+}
+
+func (r *Rotator) removeFromActive(b *tunnelBinding) {
+	cur := r.activeSet.Load()
+	if cur == nil {
+		return
+	}
+	next := make([]*tunnelBinding, 0, len(*cur))
+	for _, x := range *cur {
+		if x != b {
+			next = append(next, x)
+		}
+	}
+	r.activeSet.Store(&next)
+	// Keep `current` pointing at a live member so Stats/ExitIPProvider
+	// never report a retired exit.
+	if r.current.Load() == b {
+		if len(next) > 0 {
+			r.current.Store(next[0])
+		}
+	}
+}
+
+// activeExitSet returns the set of exit IPs currently live (for distinct-pick).
+func (r *Rotator) activeExitSet() map[string]bool {
+	out := map[string]bool{}
+	if setp := r.activeSet.Load(); setp != nil {
+		for _, b := range *setp {
+			out[b.server.EntryIP] = true
+		}
+	}
+	return out
+}
+
+// activeCount returns the number of non-retiring live bindings.
+func (r *Rotator) activeCount() int {
+	setp := r.activeSet.Load()
+	if setp == nil {
+		return 0
+	}
+	return len(*setp)
 }
 
 // hostGate returns the <-ready channel if host is currently quarantined,
@@ -346,14 +474,18 @@ func (r *Rotator) ForceRotate(ctx context.Context) error {
 
 // rotate brings up a new tunnel and swaps it into place. Serialized
 // via rotMu so at most one tunnel creation runs at a time.
-func (r *Rotator) rotate(ctx context.Context, reason string) (*tunnelBinding, error) {
+// addOne builds ONE new live tunnel and registers it into `all` + the
+// active set, making it `current`. It is the shared builder used by
+// Bootstrap (fill), rotate (swap), maintainLoop (backfill), and
+// SwitchAvoiding (replace). Acquires rotMu itself — callers must NOT hold it.
+func (r *Rotator) addOne(ctx context.Context, reason string) (*tunnelBinding, error) {
 	if r.closed.Load() {
 		return nil, errors.New("rotator closed")
 	}
 	r.rotMu.Lock()
 	defer r.rotMu.Unlock()
 
-	// Global min-interval backstop.
+	// Global min-interval backstop (paces tunnel creation against Proton).
 	if r.opts.GlobalMinInterval > 0 {
 		if lastNs := r.lastRotAt.Load(); lastNs > 0 {
 			wait := r.opts.GlobalMinInterval - time.Since(time.Unix(0, lastNs))
@@ -367,11 +499,16 @@ func (r *Rotator) rotate(ctx context.Context, reason string) (*tunnelBinding, er
 		}
 	}
 
+	// Exclude exits already live so the pool grows to N DISTINCT IPs
+	// (weighted-random Next would otherwise keep re-picking high-scored
+	// active exits and the pool couldn't grow). Snapshot is stable: addOne
+	// holds rotMu and only appends at the very end.
+	exclude := r.activeExitSet()
 	var lastErr error
 	for attempt := 0; attempt < r.opts.Pool.Size()+1; attempt++ {
-		srv, ok := r.opts.Pool.Next()
+		srv, ok := r.opts.Pool.NextExcluding(exclude)
 		if !ok {
-			return nil, fmt.Errorf("rotator: no healthy server in pool (last err: %v)", lastErr)
+			return nil, fmt.Errorf("rotator: no distinct healthy server available (active=%d, last err: %v)", len(exclude), lastErr)
 		}
 		// Belt-and-suspenders pubkey pin check.
 		expected, known := r.opts.Catalog.ExpectedPubkey(srv.EntryIP)
@@ -422,7 +559,6 @@ func (r *Rotator) rotate(ctx context.Context, reason string) (*tunnelBinding, er
 		// Probe succeeded — record positive outcome so this IP is preferred
 		// in future weighted-random picks and fallback selection.
 		r.opts.Pool.RecordOutcome(srv.EntryIP, true)
-		// Success. Register the new binding, swap current, retire old.
 		nb := &tunnelBinding{
 			tun:       tun,
 			server:    srv,
@@ -432,25 +568,122 @@ func (r *Rotator) rotate(ctx context.Context, reason string) (*tunnelBinding, er
 		r.all = append(r.all, nb)
 		r.allMu.Unlock()
 
-		prev := r.current.Swap(nb)
-		if prev != nil {
-			prev.retiring.Store(true)
-			prev.retiredAt.Store(time.Now().UnixNano())
-		}
+		r.addToActive(nb)
+		r.current.Store(nb) // newest is "current" for Stats/fallback
 		r.rotations.Add(1)
 		r.lastRotAt.Store(time.Now().UnixNano())
 		if r.opts.OnRotate != nil {
 			r.opts.OnRotate()
 		}
-		r.opts.Logf("rotator: rotated",
+		r.opts.Logf("rotator: tunnel up",
 			"reason", reason,
 			"name", srv.Name,
 			"country", srv.Country,
 			"entry_ip", srv.EntryIP,
-			"rotations_total", r.rotations.Load())
+			"active", r.activeCount(),
+			"target", r.opts.PoolSize)
 		return nb, nil
 	}
 	return nil, fmt.Errorf("rotator: exhausted pool without a working peer (last err: %v)", lastErr)
+}
+
+// rotate builds a fresh tunnel and retires the previous `current` — the
+// classic swap. Used by ForceRotate and the per-host 429 quarantine path.
+// With PoolSize==1 this is the original single-tunnel behavior.
+func (r *Rotator) rotate(ctx context.Context, reason string) (*tunnelBinding, error) {
+	prev := r.current.Load()
+	nb, err := r.addOne(ctx, reason)
+	if err != nil {
+		return nil, err
+	}
+	if prev != nil && prev != nb {
+		r.rotMu.Lock()
+		prev.retiring.Store(true)
+		prev.retiredAt.Store(time.Now().UnixNano())
+		r.removeFromActive(prev)
+		r.rotMu.Unlock()
+	}
+	return nb, nil
+}
+
+// SwitchAvoiding burns the binding whose exit is burnedExitIP (taint + retire
+// + drop from the active set) and ensures a different live exit is available.
+// Returns the exit IP that callers will now dial through, or "" if the pool
+// is exhausted. Used by the transport's auto-retry-on-429 path.
+func (r *Rotator) SwitchAvoiding(ctx context.Context, burnedExitIP string) (string, error) {
+	if r == nil {
+		return "", errors.New("rotator: nil (direct mode)")
+	}
+	r.rotMu.Lock()
+	var burned *tunnelBinding
+	if setp := r.activeSet.Load(); setp != nil {
+		for _, b := range *setp {
+			if b.server.EntryIP == burnedExitIP {
+				burned = b
+				break
+			}
+		}
+	}
+	if burned != nil {
+		burned.retiring.Store(true)
+		burned.retiredAt.Store(time.Now().UnixNano())
+		r.removeFromActive(burned)
+		r.opts.Pool.Taint(burnedExitIP)
+		r.opts.Pool.RecordOutcome(burnedExitIP, false)
+	}
+	remaining := r.activeCount()
+	r.rotMu.Unlock()
+
+	if remaining == 0 {
+		nb, err := r.addOne(ctx, "switch-avoid")
+		if err != nil {
+			return "", err
+		}
+		return nb.server.EntryIP, nil
+	}
+	if b := r.pickBinding(); b != nil && b.server.EntryIP != burnedExitIP {
+		return b.server.EntryIP, nil
+	}
+	if setp := r.activeSet.Load(); setp != nil && len(*setp) > 0 {
+		return (*setp)[0].server.EntryIP, nil
+	}
+	return "", errors.New("rotator: no alternate exit available")
+}
+
+// maintainLoop keeps the live tunnel count at PoolSize, backfilling ejected
+// or never-established slots. Backs off after repeated failures (Proton
+// concurrent-session cap) so it doesn't spin.
+func (r *Rotator) maintainLoop() {
+	defer close(r.maintainDone)
+	t := time.NewTicker(r.opts.ReaperInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-r.maintainStop:
+			return
+		case <-t.C:
+			if r.closed.Load() {
+				return
+			}
+			if !r.bootstrapped.Load() {
+				continue // don't race the bootstrap fill
+			}
+			if r.activeCount() >= r.opts.PoolSize {
+				continue
+			}
+			if until := r.settleUntil.Load(); until > 0 && time.Now().UnixNano() < until {
+				continue // backing off after a session-cap failure
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), r.opts.HandshakeTimeout+4*time.Second)
+			_, err := r.addOne(ctx, "backfill")
+			cancel()
+			if err != nil {
+				r.opts.Logf("rotator: pool backfill failed — settling below target",
+					"target", r.opts.PoolSize, "active", r.activeCount(), "err", err.Error())
+				r.settleUntil.Store(time.Now().Add(45 * time.Second).UnixNano())
+			}
+		}
+	}
 }
 
 // reaperLoop periodically closes retiring bindings that have drained.
@@ -500,16 +733,24 @@ func (r *Rotator) reapOnce() {
 // Stats returns observable counters for /.internal/healthz.
 func (r *Rotator) Stats() Stats {
 	s := Stats{
-		Rotations: r.rotations.Load(),
-		LastRotUn: r.lastRotAt.Load(),
-		PoolTotal: r.opts.Pool.Size(),
-		PoolUsabl: r.opts.Pool.Available(),
+		Rotations:    r.rotations.Load(),
+		LastRotUn:    r.lastRotAt.Load(),
+		PoolTotal:    r.opts.Pool.Size(),
+		PoolUsabl:    r.opts.Pool.Available(),
+		PoolTarget:   r.opts.PoolSize,
+		PoolActive:   r.activeCount(),
+		NumGoroutine: runtime.NumGoroutine(),
 	}
 	if b := r.current.Load(); b != nil {
 		s.CurrentIP = b.server.EntryIP
 		s.CurrentPub = b.server.Pubkey
 		s.CurrentName = b.server.Name
 		s.Inflight = b.inflight.Load()
+	}
+	if setp := r.activeSet.Load(); setp != nil {
+		for _, b := range *setp {
+			s.ActiveExitIPs = append(s.ActiveExitIPs, b.server.EntryIP)
+		}
 	}
 	r.allMu.Lock()
 	s.ActiveTunnels = len(r.all)
@@ -528,6 +769,10 @@ type Stats struct {
 	PoolTotal     int
 	PoolUsabl     int
 	ActiveTunnels int
+	PoolTarget    int      // configured -pool-size
+	PoolActive    int      // live bindings in the dispatch set (achieved N)
+	ActiveExitIPs []string // exit IP of each live binding
+	NumGoroutine  int
 }
 
 // Close tears down the reaper + every binding we've ever started.
@@ -535,6 +780,8 @@ func (r *Rotator) Close() {
 	if r.closed.Swap(true) {
 		return
 	}
+	close(r.maintainStop)
+	<-r.maintainDone
 	close(r.reaperStop)
 	<-r.reaperDone
 	r.allMu.Lock()

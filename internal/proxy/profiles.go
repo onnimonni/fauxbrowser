@@ -206,7 +206,15 @@ func KnownProfiles() []string {
 //   - Accept / Accept-Language / Sec-Fetch-* are semantically per-request
 //     and safe for the caller to override.
 func applyProfileDefaults(h http.Header, p BrowserProfile) http.Header {
-	// Forced: always overwrite.
+	applyForcedProfileHeaders(h, p)
+	applySoftDefaults(h)
+	return h
+}
+
+// applyForcedProfileHeaders sets ONLY the headers that must agree with the
+// TLS fingerprint (UA + sec-ch-ua bundle). Used by both the normal path and
+// passthrough mode — desyncing these from the JA3/JA4 is what breaks WAFs.
+func applyForcedProfileHeaders(h http.Header, p BrowserProfile) http.Header {
 	h.Del("User-Agent")
 	h.Set("User-Agent", p.UserAgent)
 	h.Del("sec-ch-ua")
@@ -215,8 +223,16 @@ func applyProfileDefaults(h http.Header, p BrowserProfile) http.Header {
 	h.Set("sec-ch-ua-mobile", p.SecChUaMob)
 	h.Del("sec-ch-ua-platform")
 	h.Set("sec-ch-ua-platform", p.Platform)
+	return h
+}
 
-	// Soft: fill if missing.
+// applySoftDefaults fills caller-overridable browser-document headers
+// (Accept: text/html, Sec-Fetch-*, Upgrade-Insecure-Requests, Priority).
+// SKIPPED in passthrough mode: these make a request look like a browser
+// NAVIGATING TO A DOCUMENT, which JSON/XHR API gateways (e.g. Finnish YTJ
+// tietopalvelu) reject with 502. Passthrough honors the caller's own
+// Accept/Sec-Fetch/X-Requested-With verbatim.
+func applySoftDefaults(h http.Header) http.Header {
 	for k, v := range softDefaults {
 		if h.Get(k) == "" {
 			h.Set(k, v)
