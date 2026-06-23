@@ -302,6 +302,13 @@ func run() error {
 
 	stats := proxy.NewStatsTracker()
 
+	// Avoid the typed-nil interface trap: a nil *proton.Pool stored in the
+	// ReputationRecorder interface is non-nil (panics the != nil guard in
+	// dispatch). Keep it a true-nil interface in direct mode.
+	var repRec proxy.ReputationRecorder
+	if pool != nil {
+		repRec = pool
+	}
 	transport, err = proxy.NewTransport(proxy.TransportOptions{
 		Dialer:              proxyDialer,
 		TimeoutSeconds:      cfg.TimeoutSecs,
@@ -310,7 +317,7 @@ func run() error {
 		SolverCache:         solverCache,
 		ExitIPProvider:      exitIPFn,
 		Stats:               stats,
-		ReputationRecorder:  pool, // nil in direct mode
+		ReputationRecorder:  repRec, // true-nil interface in direct mode
 		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
 		RetryAttempts:       cfg.RetryAttempts,
 		ExitSwitcher:        exitSwitcher, // nil in direct mode → retry disabled
