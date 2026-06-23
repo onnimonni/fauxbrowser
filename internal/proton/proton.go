@@ -398,7 +398,13 @@ func (p *Pool) Scores() map[string]float64 {
 // attempt a connection. This prevents hard failures when a transient
 // network condition taints all peers simultaneously — the system keeps
 // trying rather than stopping. If no servers exist at all, returns false.
-func (p *Pool) Next() (Server, bool) {
+func (p *Pool) Next() (Server, bool) { return p.NextExcluding(nil) }
+
+// NextExcluding is Next but skips servers whose EntryIP is in `exclude`
+// (in addition to tainted ones). Used by the tunnel pool to pick N DISTINCT
+// exits — without this, weighted-random favors high-scored servers and keeps
+// re-returning exits already live, so the pool can't grow past a few tunnels.
+func (p *Pool) NextExcluding(exclude map[string]bool) (Server, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.servers) == 0 {
@@ -411,7 +417,7 @@ func (p *Pool) Next() (Server, bool) {
 			delete(p.tainted, ip)
 		}
 	}
-	// Build weighted candidate list from non-tainted servers.
+	// Build weighted candidate list from non-tainted, non-excluded servers.
 	type candidate struct {
 		srv    Server
 		weight float64
@@ -422,11 +428,20 @@ func (p *Pool) Next() (Server, bool) {
 		if _, bad := p.tainted[s.EntryIP]; bad {
 			continue
 		}
+		if exclude[s.EntryIP] {
+			continue
+		}
 		w := p.scoreFor(s.EntryIP)
 		cands = append(cands, candidate{s, w})
 		totalWeight += w
 	}
 	if len(cands) == 0 {
+		// When excluding (pool fill wants a DISTINCT exit) and nothing is
+		// left, report exhaustion so the caller settles below target —
+		// do NOT fall back to an excluded/duplicate server.
+		if len(exclude) > 0 {
+			return Server{}, false
+		}
 		// All servers tainted. Fall back to the best-scored one so the
 		// rotator can still attempt tunnels. The server's taint is
 		// temporarily lifted; the rotator re-taints on failure, so the

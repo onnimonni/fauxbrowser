@@ -251,6 +251,9 @@ missing or incomplete, which leads to upstream HTTPS failures like
 -allow-version-mismatch  start if chromium major ≠ profile major   (default false)
 -auth-token            bearer token on the proxy listener          (MANDATORY for non-loopback)
 -admin-token           bearer token on the admin listener          (MANDATORY for non-loopback)
+-pool-size             concurrent live tunnels / exit IPs          (default 1; N>1 = least-loaded dispatch)
+-retry-attempts        max attempts on 429/WAF (retry on new exit) (default 3; 1 = disabled)
+-passthrough-headers   skip browser-document header forging        (default false; for JSON/XHR APIs)
 -timeout               per-request upstream timeout, seconds       (default 60)
 -cooldown              per-server taint cooldown, seconds          (default 900)
 -handshake-wait        max WG handshake wait per rotation attempt  (default 6s)
@@ -383,6 +386,44 @@ When a rotation is triggered:
    refuses to rotate again — the upstream response passes through
    unchanged. This prevents concurrent bursts of 429s from burning
    the Proton pool.
+
+## Concurrent tunnel pool (`-pool-size N`)
+
+By default fauxbrowser runs ONE live exit and rotates it on 429/WAF. With
+`-pool-size N` it keeps **N live tunnels** at once and dispatches each request
+to the **least-loaded** one (round-robin tiebreak), so aggregate throughput is
+≈ `N × the target's per-exit-IP rate limit`. Backward compatible: `-pool-size 1`
+(the default) is the classic single-tunnel behavior.
+
+- The pool self-heals: if an exit is burned (429 retry, manual rotate) it's
+  ejected and a maintain loop backfills a fresh distinct exit back up to N.
+- Distinct exits only — the pool never holds two tunnels on the same exit IP.
+- If Proton's concurrent-session cap is reached before N, the pool **settles**
+  at the achievable count and logs it (no hot-spin).
+- `GET /.internal/healthz` reports `PoolTarget`, `PoolActive`, `ActiveExitIPs`.
+
+**Auto-retry on a different exit** — `-retry-attempts K` (default 3): when a
+request is blocked by `429`/WAF, fauxbrowser transparently **replays it on a
+different live exit** (tainting the burned one), returning the first success.
+Idempotent only: `GET`/`HEAD` always; other methods need
+`X-Fauxbrowser-Retry: idempotent`. Forward-proxy mode only (CONNECT can't see
+the status).
+
+**Passthrough headers** — `-passthrough-headers` (or per-request
+`X-Fauxbrowser-Passthrough: 1`): skip the browser-document header forging
+(`Accept: text/html`, `Sec-Fetch-*`, header order) while keeping UA/sec-ch-ua/
+TLS coherence. Needed for **JSON/XHR APIs** that return `502` when hit with a
+browser-navigation request shape. Required for auto-retry to work on such APIs
+(status must be visible → forward-proxy + non-forged request).
+
+### How many tunnels can one host run?
+
+Measured on a laptop with a **premium** Proton key (`-vpn-tier paid`): N=4, 8,
+and **12** all brought up the full set of **distinct** FI exits with no
+session-cap stall, at ≈46 goroutines + ~10 MB RAM per tunnel (trivial RSS).
+The handshake ceiling is well above 12; the practical limit is the target's
+tolerance and your throughput needs, not the laptop. Start at `-pool-size 8`
+and raise it while `PoolActive == PoolTarget` in healthz.
 
 ## Cookie policy
 

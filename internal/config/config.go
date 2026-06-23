@@ -93,6 +93,20 @@ type Config struct {
 	MaxRetireAge      time.Duration // force-close retired tunnels past this age
 	ReaperInterval    time.Duration // how often the reaper scans
 
+	// PoolSize is the target number of concurrent live tunnels (exit IPs).
+	// 1 = classic single-tunnel behavior. N>1 dispatches least-loaded across
+	// N exits → throughput ≈ N × per-IP rate limit (bounded by Proton's
+	// concurrent-session cap, ~10 for Plus).
+	PoolSize int
+
+	// RetryAttempts: max dispatch attempts per request when blocked by
+	// 429/WAF. >1 auto-retries on a DIFFERENT exit (GET/HEAD, or opt-in).
+	RetryAttempts int
+
+	// PassthroughHeaders skips browser-document header forging (Accept:
+	// text/html, Sec-Fetch-*, header order) so JSON/XHR APIs don't 502.
+	PassthroughHeaders bool
+
 	LogLevel string
 }
 
@@ -106,6 +120,8 @@ func Default() *Config {
 		SolverTTL:     25 * time.Minute,
 		SolverTimeout: 30 * time.Second,
 		MaxIdleConnsPerHost: 100,
+		PoolSize:            1,
+		RetryAttempts:       3,
 		TimeoutSecs:         60,
 		CooldownSecs:        900, // 15 min
 		HandshakeWait:     6 * time.Second,
@@ -207,6 +223,22 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("FAUXBROWSER_MAX_IDLE_CONNS_PER_HOST"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.MaxIdleConnsPerHost = n
+		}
+	}
+	if v := os.Getenv("FAUXBROWSER_POOL_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.PoolSize = n
+		}
+	}
+	if v := os.Getenv("FAUXBROWSER_RETRY_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.RetryAttempts = n
+		}
+	}
+	if v := strings.ToLower(os.Getenv("FAUXBROWSER_PASSTHROUGH_HEADERS")); v != "" {
+		switch v {
+		case "1", "true", "on", "yes":
+			c.PassthroughHeaders = true
 		}
 	}
 	if v := os.Getenv("FAUXBROWSER_TIMEOUT"); v != "" {
