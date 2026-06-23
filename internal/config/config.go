@@ -26,7 +26,7 @@ type Config struct {
 	WGPrivateKey string
 
 	// Proton server filter.
-	VPNTier       string   // "free" (default), "paid"/"plus", "all"
+	VPNTier       string   // "all" (default), "free", "paid"/"plus"
 	VPNCountries  []string // ISO alpha-2
 	VPNContinents []string // EU, NA, AS, ...
 
@@ -100,7 +100,7 @@ func Default() *Config {
 	return &Config{
 		Listen:        "127.0.0.1:18443",
 		TargetHeader:  "X-Target-URL",
-		VPNTier:       "free",
+		VPNTier:       "all",
 		Profile:       "chrome146",
 		Solver:        "none",
 		SolverTTL:     25 * time.Minute,
