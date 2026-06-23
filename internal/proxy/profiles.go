@@ -229,9 +229,9 @@ func applyForcedProfileHeaders(h http.Header, p BrowserProfile) http.Header {
 // applySoftDefaults fills caller-overridable browser-document headers
 // (Accept: text/html, Sec-Fetch-*, Upgrade-Insecure-Requests, Priority).
 // SKIPPED in passthrough mode: these make a request look like a browser
-// NAVIGATING TO A DOCUMENT, which JSON/XHR API gateways (e.g. Finnish YTJ
-// tietopalvelu) reject with 502. Passthrough honors the caller's own
-// Accept/Sec-Fetch/X-Requested-With verbatim.
+// NAVIGATING TO A DOCUMENT, which some JSON/XHR API gateways reject with
+// 502. Passthrough honors the caller's own Accept/Sec-Fetch/X-Requested-With
+// verbatim.
 func applySoftDefaults(h http.Header) http.Header {
 	for k, v := range softDefaults {
 		if h.Get(k) == "" {

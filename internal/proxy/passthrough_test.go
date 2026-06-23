@@ -7,8 +7,8 @@ import (
 
 // Passthrough must keep the forced UA/sec-ch-ua (TLS↔UA coherence) but NOT
 // inject the browser-document soft defaults (Accept:text/html, Sec-Fetch-*),
-// and must preserve the caller's own headers — that's what stops JSON API
-// gateways (YTJ) from 502ing.
+// and must preserve the caller's own headers — that's what stops some JSON
+// API gateways from 502ing.
 func TestPassthroughSkipsSoftDefaults(t *testing.T) {
 	p := SelectProfile(DefaultProfile)
 
