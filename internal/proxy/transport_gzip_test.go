@@ -22,10 +22,10 @@ import (
 // ContentLength is set to -1.
 func TestGzipContentLengthFix(t *testing.T) {
 	cases := []struct {
-		name           string
-		contentEnc     string
-		contentLen     string
-		shouldRewrite  bool
+		name          string
+		contentEnc    string
+		contentLen    string
+		shouldRewrite bool
 	}{
 		{"gzip", "gzip", "102960", true},
 		{"br", "br", "12345", true},

@@ -210,9 +210,9 @@ type Pool struct {
 	cooldown int64              // seconds
 	now      func() int64       // injected for tests
 
-	scoresPath  string        // path for score persistence; empty = disabled
-	saveTimer   *time.Timer   // debounce timer for async save
-	savePending bool          // true while timer is armed
+	scoresPath  string      // path for score persistence; empty = disabled
+	saveTimer   *time.Timer // debounce timer for async save
+	savePending bool        // true while timer is armed
 }
 
 // NewPool returns a randomly-ordered Pool of the given servers.

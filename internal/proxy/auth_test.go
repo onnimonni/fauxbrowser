@@ -83,14 +83,14 @@ func TestBearerAuthSchemeCaseInsensitive(t *testing.T) {
 
 func TestExtractBearer(t *testing.T) {
 	cases := map[string]string{
-		"":                         "",
-		"Bearer":                   "",
-		"Bearer ":                  "",
-		"Bearer abc":               "abc",
-		"bearer abc":               "abc",
-		"Bearer    trimmed":        "trimmed",
-		"Basic Zm9vOmJhcg==":       "",
-		"Digest realm=x, nonce=y":  "",
+		"":                        "",
+		"Bearer":                  "",
+		"Bearer ":                 "",
+		"Bearer abc":              "abc",
+		"bearer abc":              "abc",
+		"Bearer    trimmed":       "trimmed",
+		"Basic Zm9vOmJhcg==":      "",
+		"Digest realm=x, nonce=y": "",
 	}
 	for in, want := range cases {
 		if got := extractBearer(in); got != want {

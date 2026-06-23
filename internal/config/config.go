@@ -40,10 +40,10 @@ type Config struct {
 	// launches a fresh headless Chromium per solve via chromedp,
 	// routes its traffic back through fauxbrowser CONNECT, extracts
 	// clearance cookies, and caches them per (host, exit_ip).
-	Solver         string        // "none" (default), "chromedp"
-	SolverTTL      time.Duration // cookie cache TTL (default 25m)
-	SolverTimeout  time.Duration // per-solve browser deadline (default 30s)
-	ChromiumPath   string        // override Chromium binary path (default = $PATH lookup)
+	Solver        string        // "none" (default), "chromedp"
+	SolverTTL     time.Duration // cookie cache TTL (default 25m)
+	SolverTimeout time.Duration // per-solve browser deadline (default 30s)
+	ChromiumPath  string        // override Chromium binary path (default = $PATH lookup)
 
 	// CookieStorePath is an optional file path for persisting the
 	// solver's CF cookie cache to disk. When set, the cache is
@@ -83,8 +83,8 @@ type Config struct {
 	// for 500+ concurrent crawl workers. 0 means "use the default (2)".
 	MaxIdleConnsPerHost int
 
-	TimeoutSecs  int
-	CooldownSecs int // taint cooldown per server after 429/403
+	TimeoutSecs   int
+	CooldownSecs  int           // taint cooldown per server after 429/403
 	HandshakeWait time.Duration // handshake observation window per rotation attempt
 
 	// Blue/green rotator tuning.
@@ -112,24 +112,24 @@ type Config struct {
 
 func Default() *Config {
 	return &Config{
-		Listen:        "127.0.0.1:18443",
-		TargetHeader:  "X-Target-URL",
-		VPNTier:       "all",
-		Profile:       "chrome146",
-		Solver:        "none",
-		SolverTTL:     25 * time.Minute,
-		SolverTimeout: 30 * time.Second,
+		Listen:              "127.0.0.1:18443",
+		TargetHeader:        "X-Target-URL",
+		VPNTier:             "all",
+		Profile:             "chrome146",
+		Solver:              "none",
+		SolverTTL:           25 * time.Minute,
+		SolverTimeout:       30 * time.Second,
 		MaxIdleConnsPerHost: 100,
 		PoolSize:            1,
 		RetryAttempts:       3,
 		TimeoutSecs:         60,
 		CooldownSecs:        900, // 15 min
-		HandshakeWait:     6 * time.Second,
-		MinHostRotation:   5 * time.Minute,
-		GlobalMinInterval: 2 * time.Second,
-		MaxRetireAge:      2 * time.Minute,
-		ReaperInterval:    5 * time.Second,
-		LogLevel:          "info",
+		HandshakeWait:       6 * time.Second,
+		MinHostRotation:     5 * time.Minute,
+		GlobalMinInterval:   2 * time.Second,
+		MaxRetireAge:        2 * time.Minute,
+		ReaperInterval:      5 * time.Second,
+		LogLevel:            "info",
 	}
 }
 

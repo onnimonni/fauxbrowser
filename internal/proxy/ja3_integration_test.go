@@ -218,4 +218,3 @@ func fetchPeetViaChromedp(userAgent string) (*peetResponse, error) {
 	}
 	return &out, nil
 }
-

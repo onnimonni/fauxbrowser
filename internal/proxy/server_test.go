@@ -254,14 +254,14 @@ func TestConnectTunnel(t *testing.T) {
 // used by handleConnect.
 func TestNormalizeConnectTarget(t *testing.T) {
 	cases := map[string]string{
-		"":                    "",
-		"example.com":         "example.com:443",
-		"example.com:8443":    "example.com:8443",
-		"example.com:80":      "example.com:80",
-		"127.0.0.1":           "127.0.0.1:443",
-		"127.0.0.1:18443":     "127.0.0.1:18443",
-		"[::1]":               "[::1]:443",
-		"[::1]:443":           "[::1]:443",
+		"":                 "",
+		"example.com":      "example.com:443",
+		"example.com:8443": "example.com:8443",
+		"example.com:80":   "example.com:80",
+		"127.0.0.1":        "127.0.0.1:443",
+		"127.0.0.1:18443":  "127.0.0.1:18443",
+		"[::1]":            "[::1]:443",
+		"[::1]:443":        "[::1]:443",
 	}
 	for in, want := range cases {
 		if got := normalizeConnectTarget(in); got != want {

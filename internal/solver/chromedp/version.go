@@ -13,10 +13,11 @@ import (
 // --version` / `google-chrome --version` output. Captures the major.
 //
 // Example outputs we handle:
-//   "Chromium 146.0.7680.177"
-//   "Chromium 146.0.7680.177 snap"
-//   "Google Chrome 146.0.7190.80 "
-//   "Chromium 146.0.7680.177 Built on Ubuntu..."
+//
+//	"Chromium 146.0.7680.177"
+//	"Chromium 146.0.7680.177 snap"
+//	"Google Chrome 146.0.7190.80 "
+//	"Chromium 146.0.7680.177 Built on Ubuntu..."
 var versionRe = regexp.MustCompile(`\b(\d+)\.\d+\.\d+\.\d+\b`)
 
 // DetectChromiumMajor runs `{binary} --version` and parses the Chrome

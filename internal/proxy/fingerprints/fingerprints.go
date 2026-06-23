@@ -32,8 +32,8 @@
 package fingerprints
 
 import (
-	"encoding/hex"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"

@@ -45,7 +45,7 @@ func (s *stubSolver) Solve(ctx context.Context, target *url.URL) (*Solution, err
 	}, nil
 }
 
-func (s *stubSolver) Name() string  { return "stub" }
+func (s *stubSolver) Name() string { return "stub" }
 func (s *stubSolver) Close() error { return nil }
 
 func TestCacheLookupMissAndStore(t *testing.T) {

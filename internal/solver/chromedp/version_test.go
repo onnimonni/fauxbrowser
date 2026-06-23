@@ -4,11 +4,11 @@ import "testing"
 
 func TestVersionRegex(t *testing.T) {
 	cases := map[string]int{
-		"Chromium 146.0.7680.177\n":                    146,
-		"Chromium 146.0.7680.177 snap\n":               146,
-		"Google Chrome 146.0.7190.80 \n":               146,
-		"Chromium 131.0.6778.85 Built on Ubuntu\n":     131,
-		"Chromium 144.0.0.0\n":                         144,
+		"Chromium 146.0.7680.177\n":                146,
+		"Chromium 146.0.7680.177 snap\n":           146,
+		"Google Chrome 146.0.7190.80 \n":           146,
+		"Chromium 131.0.6778.85 Built on Ubuntu\n": 131,
+		"Chromium 144.0.0.0\n":                     144,
 	}
 	for in, want := range cases {
 		m := versionRe.FindStringSubmatch(in)

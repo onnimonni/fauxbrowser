@@ -19,7 +19,7 @@ func TestResolveCountryNames(t *testing.T) {
 		{[]string{"Netherlands", "Germany", "JP"}, []string{"NL", "DE", "JP"}},
 		{[]string{"USA", "Canada"}, []string{"US", "CA"}},
 		{[]string{"United States", "United Kingdom"}, []string{"US", "GB"}},
-		{[]string{"Atlantis"}, []string{}},                                  // unknown name → dropped
+		{[]string{"Atlantis"}, []string{}}, // unknown name → dropped
 		{[]string{"NL", "Atlantis", "Germany"}, []string{"NL", "DE"}},
 	}
 	for _, c := range cases {
@@ -65,10 +65,10 @@ func TestLoadEnvNativeOverridesGluetun(t *testing.T) {
 
 func TestLoadEnvFreeOnlyVariants(t *testing.T) {
 	cases := map[string]string{
-		"on":    "free",
-		"true":  "free",
-		"1":     "free",
-		"yes":   "free",
+		"on":   "free",
+		"true": "free",
+		"1":    "free",
+		"yes":  "free",
 		// "off" / "false" / "0" / "no" should NOT change tier from default.
 	}
 	for v, wantTier := range cases {

@@ -7,23 +7,23 @@ import (
 
 func TestAcceptLanguageForCCTLD(t *testing.T) {
 	cases := map[string]string{
-		"www.shop.example.fi":    "fi-FI",
-		"shop.example.se":   "sv-SE",
-		"www.proshop.dk":    "da-DK",
-		"www.amazon.de":     "de-DE",
-		"store.example.at":  "de-AT",
-		"www.cdiscount.fr":  "fr-FR",
-		"www.bol.nl":        "nl-NL",
-		"www.allegro.pl":    "pl-PL",
-		"www.notino.cz":     "cs-CZ",
-		"www.emag.ro":       "ro-RO",
-		"www.argos.co.uk":   "en-GB",
-		"www.example.ie":    "en-IE",
-		"www.example.ee":    "et-EE",
-		"www.example.lt":    "lt-LT",
-		"www.example.lv":    "lv-LV",
-		"www.example.no":    "nb-NO",
-		"www.example.gr":    "el-GR",
+		"www.shop.example.fi": "fi-FI",
+		"shop.example.se":     "sv-SE",
+		"www.proshop.dk":      "da-DK",
+		"www.amazon.de":       "de-DE",
+		"store.example.at":    "de-AT",
+		"www.cdiscount.fr":    "fr-FR",
+		"www.bol.nl":          "nl-NL",
+		"www.allegro.pl":      "pl-PL",
+		"www.notino.cz":       "cs-CZ",
+		"www.emag.ro":         "ro-RO",
+		"www.argos.co.uk":     "en-GB",
+		"www.example.ie":      "en-IE",
+		"www.example.ee":      "et-EE",
+		"www.example.lt":      "lt-LT",
+		"www.example.lv":      "lv-LV",
+		"www.example.no":      "nb-NO",
+		"www.example.gr":      "el-GR",
 	}
 	for hostname, wantPrefix := range cases {
 		got := AcceptLanguageForHost(hostname)
@@ -68,12 +68,12 @@ func TestAcceptLanguageForGenericTLD(t *testing.T) {
 
 func TestExtractTLD(t *testing.T) {
 	cases := map[string]string{
-		"www.shop.example.fi":         "fi",
-		"shop.example.co.uk":     "uk",
-		"example.com":            "com",
-		"a.b.c.d.de":             "de",
-		"localhost":              "",
-		"127.0.0.1":              "1", // IP — not a real TLD, but harmless
+		"www.shop.example.fi": "fi",
+		"shop.example.co.uk":  "uk",
+		"example.com":         "com",
+		"a.b.c.d.de":          "de",
+		"localhost":           "",
+		"127.0.0.1":           "1", // IP — not a real TLD, but harmless
 	}
 	for in, want := range cases {
 		got := extractTLD(in)

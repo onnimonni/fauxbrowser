@@ -9,16 +9,16 @@ import (
 
 func TestIsNonLoopback(t *testing.T) {
 	cases := map[string]bool{
-		"":                   false, // empty = skip (AdminListen off)
-		"127.0.0.1:18443":    false,
-		"localhost:18443":    false,
-		"[::1]:18443":        false,
-		"0.0.0.0:18443":      true,
-		"10.0.0.1:18443":     true,
-		"192.168.1.1:18443":  true,
-		"fauxbrowser:18443":  true, // unknown hostname → non-loopback
-		"broken":             true, // unparseable → fail-safe
-		"127.0.0.2:18443":    false, // entire 127/8 is loopback
+		"":                  false, // empty = skip (AdminListen off)
+		"127.0.0.1:18443":   false,
+		"localhost:18443":   false,
+		"[::1]:18443":       false,
+		"0.0.0.0:18443":     true,
+		"10.0.0.1:18443":    true,
+		"192.168.1.1:18443": true,
+		"fauxbrowser:18443": true,  // unknown hostname → non-loopback
+		"broken":            true,  // unparseable → fail-safe
+		"127.0.0.2:18443":   false, // entire 127/8 is loopback
 	}
 	for in, want := range cases {
 		if got := isNonLoopback(in); got != want {

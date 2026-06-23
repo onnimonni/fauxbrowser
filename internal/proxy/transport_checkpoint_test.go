@@ -9,9 +9,9 @@ import (
 
 func TestPeekCheckPoint(t *testing.T) {
 	cases := []struct {
-		name    string
-		body    string
-		want    bool
+		name string
+		body string
+		want bool
 	}{
 		{
 			name: "checkpoint block page",

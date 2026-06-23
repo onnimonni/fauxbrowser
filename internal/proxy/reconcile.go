@@ -17,21 +17,21 @@ import (
 //
 //  2. requested empty or "latest" + chromiumMajor known:
 //     → pick the profile table entry with matching Major. If one
-//       exists, return it. If none (chromium is newer than every
-//       profile bogdanfinn/tls-client ships), the behavior depends
-//       on allowMismatch:
-//         false → error. The operator must bump tls-client, downgrade
-//                 chromium, or pass -allow-version-mismatch.
-//         true  → loud warn + return DefaultProfile. Solve-time and
-//                 fast-path TLS fingerprints will differ by at least
-//                 one major version; cookie portability is at risk.
+//     exists, return it. If none (chromium is newer than every
+//     profile bogdanfinn/tls-client ships), the behavior depends
+//     on allowMismatch:
+//     false → error. The operator must bump tls-client, downgrade
+//     chromium, or pass -allow-version-mismatch.
+//     true  → loud warn + return DefaultProfile. Solve-time and
+//     fast-path TLS fingerprints will differ by at least
+//     one major version; cookie portability is at risk.
 //
 //  3. requested explicit + chromiumMajor known:
 //     → resolve to a table entry via SelectProfile. If its Major
-//       equals chromiumMajor, return it. Otherwise behavior depends
-//       on allowMismatch:
-//         false → error.
-//         true  → loud warn + return the explicitly requested name.
+//     equals chromiumMajor, return it. Otherwise behavior depends
+//     on allowMismatch:
+//     false → error.
+//     true  → loud warn + return the explicitly requested name.
 //
 // The function is deliberately a pure mapper (it logs but does no I/O)
 // so profiles_test can exercise it without touching real Chromium.

@@ -11,13 +11,13 @@ import (
 type Diagnosis string
 
 const (
-	DiagnosisHealthy          Diagnosis = "healthy"
-	DiagnosisSolverHandlesIt  Diagnosis = "solver_handles_it"
-	DiagnosisCookieBinding    Diagnosis = "cookie_binding"
+	DiagnosisHealthy           Diagnosis = "healthy"
+	DiagnosisSolverHandlesIt   Diagnosis = "solver_handles_it"
+	DiagnosisCookieBinding     Diagnosis = "cookie_binding"
 	DiagnosisIPReputationBlock Diagnosis = "ip_reputation_block"
-	DiagnosisRateLimited      Diagnosis = "rate_limited"
-	DiagnosisIPDependent      Diagnosis = "ip_dependent"
-	DiagnosisTooFewData       Diagnosis = "too_few_data"
+	DiagnosisRateLimited       Diagnosis = "rate_limited"
+	DiagnosisIPDependent       Diagnosis = "ip_dependent"
+	DiagnosisTooFewData        Diagnosis = "too_few_data"
 )
 
 // StatsTracker records per-host request outcomes for diagnostics.

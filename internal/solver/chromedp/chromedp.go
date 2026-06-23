@@ -226,13 +226,13 @@ func (s *Solver) Solve(ctx context.Context, target *url.URL) (*solver.Solution, 
 // This is necessary for WAFs (like Vercel) that use cookie names
 // we can't enumerate in advance.
 var knownChallengeTitles = []string{
-	"just a moment",           // Cloudflare IUAM / Turnstile
+	"just a moment",              // Cloudflare IUAM / Turnstile
 	"vercel security checkpoint", // Vercel bot protection
-	"security check",          // generic checkpoint pages
-	"access denied",           // pre-challenge denial page
-	"please wait",             // generic wait pages
-	"ddos-guard",              // DDoS-Guard
-	"checking your browser",   // generic checks
+	"security check",             // generic checkpoint pages
+	"access denied",              // pre-challenge denial page
+	"please wait",                // generic wait pages
+	"ddos-guard",                 // DDoS-Guard
+	"checking your browser",      // generic checks
 }
 
 func (s *Solver) waitForSolve(ctx context.Context, host string) error {
