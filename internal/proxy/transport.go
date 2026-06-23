@@ -131,6 +131,11 @@ type TransportOptions struct {
 	// PassthroughHeaders globally skips browser-document header forging
 	// (see passthroughHeader). Per-request override via the header.
 	PassthroughHeaders bool
+
+	// NoFollowRedirects returns 3xx responses (status + Location +
+	// Set-Cookie) to the caller instead of following them, so a client can
+	// drive a multi-hop redirect/cookie flow itself over X-Target-URL mode.
+	NoFollowRedirects bool
 }
 
 // Transport is an http.RoundTripper backed by a single tls-client with
@@ -189,6 +194,11 @@ func (t *Transport) rebuildClient() error {
 		tls_client.WithClientProfile(t.profile.TLSProfile),
 		tls_client.WithCookieJar(tls_client.NewCookieJar()),
 		tls_client.WithRandomTLSExtensionOrder(),
+	}
+	if t.opts.NoFollowRedirects {
+		opts = append(opts, tls_client.WithNotFollowRedirects())
+	}
+	opts = append(opts,
 		tls_client.WithProxyDialerFactory(func(
 			_ string,
 			_ time.Duration,
@@ -198,7 +208,7 @@ func (t *Transport) rebuildClient() error {
 		) (proxy.ContextDialer, error) {
 			return t.opts.Dialer, nil
 		}),
-	}
+	)
 	// Always apply transport options so MaxIdleConnsPerHost takes effect
 	// even when no custom RootCAs were provided. tls-client's built-in
 	// default is MaxIdleConnsPerHost=2, which is far too low for

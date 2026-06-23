@@ -122,6 +122,32 @@ CONNECT is the right mode for routing an HTTP_PROXY-aware client
   (also accepted). Failure on CONNECT returns 407 Proxy
   Authentication Required.
 
+### Driving a multi-hop redirect/cookie flow without CONNECT
+
+Some sites (Spring WebFlow, ASP.NET WebForms, OAuth dances) need the
+client to drive a sequence of hops — read each `Location` + `Set-Cookie`,
+extract a CSRF/flow token from the body, POST it back — keeping cookies
+across hops. CONNECT can tunnel this but loses TLS forging and rotation
+visibility (see caveats above). To do it over **X-Target-URL** instead:
+
+```sh
+fauxbrowser -wg-conf <conf> -vpn-tier paid \
+  -passthrough-headers \    # honor your Cookie/Accept/Origin/Referer verbatim
+  -no-follow-redirects \    # return 3xx (status + Location + Set-Cookie), don't chase
+  -pool-size 1              # one stable exit so the flow's cookies/session don't split
+```
+
+With `-no-follow-redirects`, fauxbrowser returns each 3xx to you (with
+`Location` and upstream `Set-Cookie`) so your client walks the flow hop
+by hop, re-sending the `Cookie` it accumulates — while every hop is still
+TLS-forged through the Proton exit. Keep `-pool-size 1` (or a sticky
+exit) so all hops of one flow share one IP; on a throttle, `POST
+/.internal/rotate` to move the whole next flow to a fresh exit.
+
+> Without `-no-follow-redirects`, fauxbrowser follows redirects itself
+> and you only see the final response — fine for a single GET, useless
+> for a token-carrying multi-hop flow.
+
 ### From Elixir (Mint / Finch)
 
 ```elixir

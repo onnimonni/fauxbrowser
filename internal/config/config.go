@@ -107,6 +107,12 @@ type Config struct {
 	// text/html, Sec-Fetch-*, header order) so JSON/XHR APIs don't 502.
 	PassthroughHeaders bool
 
+	// NoFollowRedirects makes fauxbrowser return 3xx responses (status +
+	// Location + Set-Cookie) to the caller instead of following them. Lets a
+	// client drive a multi-hop redirect/cookie flow itself over X-Target-URL
+	// mode (no CONNECT) while still getting TLS forging + exit rotation.
+	NoFollowRedirects bool
+
 	LogLevel string
 }
 
@@ -239,6 +245,12 @@ func (c *Config) LoadEnv() {
 		switch v {
 		case "1", "true", "on", "yes":
 			c.PassthroughHeaders = true
+		}
+	}
+	if v := strings.ToLower(os.Getenv("FAUXBROWSER_NO_FOLLOW_REDIRECTS")); v != "" {
+		switch v {
+		case "1", "true", "on", "yes":
+			c.NoFollowRedirects = true
 		}
 	}
 	if v := os.Getenv("FAUXBROWSER_TIMEOUT"); v != "" {

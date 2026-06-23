@@ -71,6 +71,7 @@ func run() error {
 	fs.IntVar(&cfg.PoolSize, "pool-size", cfg.PoolSize, "number of concurrent live tunnels/exit IPs (default 1; N>1 dispatches least-loaded → ~N× throughput, capped by Proton's session limit)")
 	fs.IntVar(&cfg.RetryAttempts, "retry-attempts", cfg.RetryAttempts, "max attempts per request on 429/WAF; >1 auto-retries on a different exit IP (GET/HEAD, or opt-in via X-Fauxbrowser-Retry: idempotent)")
 	fs.BoolVar(&cfg.PassthroughHeaders, "passthrough-headers", cfg.PassthroughHeaders, "skip browser-document header forging (Accept:text/html, Sec-Fetch-*, header order) so JSON/XHR APIs don't 502; keeps UA/TLS coherence")
+	fs.BoolVar(&cfg.NoFollowRedirects, "no-follow-redirects", cfg.NoFollowRedirects, "return 3xx (status+Location+Set-Cookie) to the caller instead of following; lets a client drive a multi-hop redirect/cookie flow over X-Target-URL (no CONNECT)")
 	fs.IntVar(&cfg.TimeoutSecs, "timeout", cfg.TimeoutSecs, "per-request upstream timeout seconds")
 	fs.IntVar(&cfg.CooldownSecs, "cooldown", cfg.CooldownSecs, "taint cooldown for a burned exit IP, seconds")
 	fs.DurationVar(&cfg.HandshakeWait, "handshake-wait", cfg.HandshakeWait, "max time to wait for a WireGuard handshake per rotation attempt")
@@ -314,6 +315,7 @@ func run() error {
 		RetryAttempts:       cfg.RetryAttempts,
 		ExitSwitcher:        exitSwitcher, // nil in direct mode → retry disabled
 		PassthroughHeaders:  cfg.PassthroughHeaders,
+		NoFollowRedirects:   cfg.NoFollowRedirects,
 	})
 	if err != nil {
 		return fmt.Errorf("build transport: %w", err)
