@@ -588,6 +588,14 @@ func (t *Transport) dispatch(r *http.Request) (*http.Response, error) {
 	}
 	freq.ContentLength = r.ContentLength
 	freq.Host = r.Host
+	// Framing headers are owned by the transport: fhttp emits Content-Length
+	// from freq.ContentLength (and chunks via Transfer-Encoding) at write
+	// time. Copying the caller's Content-Length/Transfer-Encoding on top of
+	// that produces a DUPLICATE Content-Length on the wire, which strict
+	// upstreams (nginx, IIS) reject as a 400 request-smuggling risk — this
+	// silently broke every POST forwarded through X-Target-URL mode.
+	egress.Del("Content-Length")
+	egress.Del("Transfer-Encoding")
 	// Replace tls-client's per-profile default headers with ours.
 	for k, vs := range egress {
 		ck := fhttp.CanonicalHeaderKey(k)
