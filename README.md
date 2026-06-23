@@ -22,9 +22,9 @@ connection and multiplex requests.
 ## Quick start
 
 ```sh
-go build -o fauxbrowser ./cmd/fauxbrowser
+go build -o fauxbrowser ./cmd/fauxbrowser  # default tier now = all (set FREE_ONLY=on for free-only)
 
-# default: any free Proton server, any country
+# default: any server (all tiers — needs premium Proton), any country
 ./fauxbrowser -wg-conf /path/to/proton.conf
 
 # lock to specific countries

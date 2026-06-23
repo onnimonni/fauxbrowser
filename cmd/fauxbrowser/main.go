@@ -51,7 +51,7 @@ func run() error {
 	fs.StringVar(&cfg.AdminListen, "admin-listen", cfg.AdminListen, "optional admin listener (GET /.internal/healthz, GET /.internal/solver, POST /.internal/rotate)")
 	fs.StringVar(&cfg.WGConf, "wg-conf", cfg.WGConf, "path to a wg-quick .conf (only PrivateKey + Address/DNS are used; peer is picked from the Proton catalog)")
 	fs.StringVar(&cfg.WGPrivateKey, "wg-private-key", cfg.WGPrivateKey, "base64 WireGuard private key (alternative to -wg-conf; gluetun-style)")
-	fs.StringVar(&cfg.VPNTier, "vpn-tier", cfg.VPNTier, "server tier: free (default), paid|plus, or all")
+	fs.StringVar(&cfg.VPNTier, "vpn-tier", cfg.VPNTier, "server tier: all (default — needs premium Proton), free, or paid|plus")
 	fs.StringVar(&cfg.Profile, "profile", cfg.Profile, "browser profile: chrome146 (default), chrome144, chrome133, chrome131, or 'latest'")
 	fs.StringVar(&cfg.Solver, "solver", cfg.Solver, "WAF challenge solver: none (default — single binary, no Chromium dep) or chromedp (launches headless Chromium on demand)")
 	fs.DurationVar(&cfg.SolverTTL, "solver-ttl", cfg.SolverTTL, "how long to cache a solved (host, exit_ip) cookie bundle")
