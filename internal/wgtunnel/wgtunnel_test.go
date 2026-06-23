@@ -37,14 +37,52 @@ PersistentKeepalive = 25
 	if len(cfg.Addresses) != 1 || cfg.Addresses[0].String() != "10.2.0.2" {
 		t.Errorf("Addresses = %v, want [10.2.0.2]", cfg.Addresses)
 	}
-	if len(cfg.DNS) != 1 || cfg.DNS[0].String() != "10.2.0.1" {
-		t.Errorf("DNS = %v, want [10.2.0.1]", cfg.DNS)
+	// normalizeForNetstack keeps the conf's IPv4 resolver and always appends
+	// the Cloudflare/Google IPv4 fallbacks (gVisor-safe resolution).
+	if len(cfg.DNS) != 3 ||
+		cfg.DNS[0].String() != "10.2.0.1" ||
+		cfg.DNS[1].String() != "1.1.1.1" ||
+		cfg.DNS[2].String() != "8.8.8.8" {
+		t.Errorf("DNS = %v, want [10.2.0.1 1.1.1.1 8.8.8.8]", cfg.DNS)
 	}
 	if cfg.PersistentKeepAlv != 25 {
 		t.Errorf("PersistentKeepalive = %d, want 25", cfg.PersistentKeepAlv)
 	}
 	if cfg.MTU != 1420 {
 		t.Errorf("MTU default = %d, want 1420", cfg.MTU)
+	}
+}
+
+// A real ProtonVPN .conf carries IPv6 interface address + IPv6 DNS, which the
+// gVisor netstack can't resolve over (UDP/IPv6) — normalizeForNetstack must
+// strip them so requests don't 502 on DNS timeouts.
+func TestParseConfigDropsIPv6(t *testing.T) {
+	conf := `
+[Interface]
+PrivateKey = lb7bveAqoEQlELeAQxUclA8AvIoOO3ZnjuXMV1V3+io=
+Address = 10.2.0.2/32, 2a07:b944::2:2/128
+DNS = 10.2.0.1, 2a07:b944::2:1
+[Peer]
+PublicKey = sxvlBotEqcKIhj6s6aW+hoKckTf0DPEFJkg99nrQ534=
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 192.0.2.1:51820
+`
+	cfg, err := parseConfig(conf)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, a := range cfg.Addresses {
+		if !a.Is4() {
+			t.Errorf("IPv6 interface address survived: %v", cfg.Addresses)
+		}
+	}
+	for _, d := range cfg.DNS {
+		if !d.Is4() {
+			t.Errorf("IPv6 DNS resolver survived: %v", cfg.DNS)
+		}
+	}
+	if len(cfg.DNS) != 3 { // 10.2.0.1 + 1.1.1.1 + 8.8.8.8
+		t.Errorf("DNS = %v, want IPv4 Proton + 2 fallbacks", cfg.DNS)
 	}
 }
 

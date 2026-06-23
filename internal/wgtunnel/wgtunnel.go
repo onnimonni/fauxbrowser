@@ -211,10 +211,49 @@ func parseConfig(text string) (*Config, error) {
 	if len(cfg.Addresses) == 0 {
 		return nil, errors.New("Interface Address missing")
 	}
-	if len(cfg.DNS) == 0 {
-		cfg.DNS = []netip.Addr{netip.MustParseAddr("10.2.0.1")}
-	}
+	normalizeForNetstack(cfg)
 	return cfg, nil
+}
+
+// normalizeForNetstack makes a parsed .conf safe for the gVisor userspace
+// netstack, which has unreliable IPv6 + UDP support:
+//   - DNS: drop IPv6 resolvers (e.g. ProtonVPN's 2a07:b944::2:1 — lookups
+//     against it time out over gVisor UDP and don't fall back, which 502s
+//     every request), and ALWAYS append the Cloudflare/Google IPv4
+//     fallbacks so resolution survives an overloaded Proton internal resolver.
+//   - Addresses: drop IPv6 interface addresses so the netstack doesn't pick
+//     an IPv6 source/egress (matches the known-good ConfigFromPrivateKey path,
+//     which is IPv4-only).
+// Proton always assigns 10.2.0.2 + 10.2.0.1, so IPv4-only loses nothing.
+func normalizeForNetstack(cfg *Config) {
+	v4 := func(addrs []netip.Addr) []netip.Addr {
+		out := addrs[:0:0]
+		for _, a := range addrs {
+			if a.Is4() {
+				out = append(out, a)
+			}
+		}
+		return out
+	}
+	cfg.Addresses = v4(cfg.Addresses)
+	cfg.DNS = v4(cfg.DNS)
+	has := func(s string) bool {
+		want := netip.MustParseAddr(s)
+		for _, d := range cfg.DNS {
+			if d == want {
+				return true
+			}
+		}
+		return false
+	}
+	if len(cfg.DNS) == 0 {
+		cfg.DNS = append(cfg.DNS, netip.MustParseAddr("10.2.0.1"))
+	}
+	for _, fb := range []string{"1.1.1.1", "8.8.8.8"} {
+		if !has(fb) {
+			cfg.DNS = append(cfg.DNS, netip.MustParseAddr(fb))
+		}
+	}
 }
 
 func splitCSV(s string) []string {
